@@ -1,0 +1,38 @@
+/* ===== Portcullis theme — slate + brass (overrides stock uhppoted palette) ===== */
+:root{
+  --background-colour:#0f141b; --footer-background-colour:#0b0f14; --footer-text-colour:#8b98a5;
+  --nav-background:#161d27; --nav-text-colour:#e0b23b;
+  --offline-border:solid 1px #e5484d; --offline-colour:#8b98a5;
+  --link-colour:#e0b23b;
+  --user-avatar-background:#1b2531; --user-avatar-shadow:0 2px 8px rgba(0,0,0,.5); --user-avatar-text-colour:#e6edf3;
+  --user-menu-background:#1b2531; --user-menu-shadow:0 10px 30px rgba(0,0,0,.6);
+  --user-menu-item-colour:#cbd5e1; --user-menu-item-highlight-colour:#0f141b; --user-menu-item-highlight-background:#e0b23b;
+  --content-controls-border:solid 1px #2a3542;
+  --content-table-background:#141b24; --content-table-background-header:#1b2531;
+  --content-table-background-odd:#121821; --content-table-background-even:#161d27;
+  --content-table-background-odd-th:#1b2531; --content-table-background-even-th:#223040;
+  --content-table-border:1px solid #2a3542; --content-table-border-left:2px solid #223040;
+  --content-table-thumb-background:#2a3542; --content-table-thumb-border:2px solid #0f141b;
+  --content-table-text-colour:#e6edf3; --content-table-item-normal-colour:#e6edf3;
+  --content-table-row-modified:#3a3420; --content-table-row-new:#16303a;
+  --content-table-row-unconfigured:#e0b23b; --content-table-row-error:#4a2122;
+}
+html,body{background:#0f141b;color:#e6edf3;font-family:'Lato',system-ui,-apple-system,sans-serif}
+a{color:#e0b23b}
+header{background:linear-gradient(90deg,#0b0f14 0%,#161d27 100%);border-bottom:2px solid #e0b23b;box-shadow:0 2px 12px rgba(0,0,0,.5)}
+#logo{height:72px;width:auto;filter:drop-shadow(0 2px 6px rgba(0,0,0,.5))}
+nav,aside{background:#0b0f14}
+main{background:#0f141b}
+button,.button{background:#e0b23b;color:#0f141b;border:none;border-radius:8px;padding:10px 20px;font-weight:700;letter-spacing:.3px;cursor:pointer;transition:background .15s,transform .05s}
+button:hover,.button:hover{background:#eac655}
+button:active,.button:active{transform:translateY(1px)}
+fieldset{background:#161d27;border:1px solid #2a3542;border-radius:14px;box-shadow:0 16px 48px rgba(0,0,0,.55);padding:26px 28px}
+legend{color:#e0b23b;font-weight:800;letter-spacing:.6px;text-transform:uppercase;font-size:.95rem}
+input,select,textarea{background:#0f141b;color:#e6edf3;border:1px solid #2a3542;border-radius:8px;padding:10px 12px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#e0b23b;box-shadow:0 0 0 3px rgba(224,178,59,.18)}
+.warning,.message .warning{background:#0f141b;color:#e5484d;border:1px solid #4a2122;border-radius:8px}
+table thead th{color:#e0b23b;text-transform:uppercase;letter-spacing:.4px;font-size:.82rem}
+footer{color:var(--footer-text-colour);background:var(--footer-background-colour);border-top:1px solid #2a3542}
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-thumb{background:#2a3542;border-radius:8px;border:2px solid #0f141b}
+::-webkit-scrollbar-track{background:#0b0f14}

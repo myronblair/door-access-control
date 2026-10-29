@@ -1,0 +1,19 @@
+[Unit]
+Description=Portcullis door-control shim (token-auth unlock for HA/JARVIS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uhppoted
+Group=uhppoted
+ExecStart=/usr/bin/python3 /opt/portcullis/doorctl.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

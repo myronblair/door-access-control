@@ -1,0 +1,48 @@
+# Portcullis door control for Home Assistant
+# HA (10.48.200.97) is firewall-allowed to reach the door-control shim on the VM (10.48.200.67:8082).
+#
+# SETUP:
+# 1. Get the shim token (on the VM):   sudo cat /etc/portcullis/doorctl.token
+# 2. In HA secrets.yaml add:           portcullis_auth: "Bearer <that-token>"
+# 3. Paste the blocks below into configuration.yaml (or a package), then restart/reload HA.
+# 4. Rename the scripts once you confirm which physical door is 1/2/3/4.
+
+rest_command:
+  portcullis_open:
+    url: "http://10.48.200.67:8082/open/{{ door }}"
+    method: POST
+    headers:
+      authorization: !secret portcullis_auth
+    content_type: "application/json"
+    payload: "{}"
+
+script:
+  portcullis_open_door_1:
+    alias: "Open Door 1"
+    icon: mdi:door
+    sequence:
+      - service: rest_command.portcullis_open
+        data: { door: 1 }
+  portcullis_open_door_2:
+    alias: "Open Door 2"
+    icon: mdi:door
+    sequence:
+      - service: rest_command.portcullis_open
+        data: { door: 2 }
+  portcullis_open_door_3:
+    alias: "Open Door 3"
+    icon: mdi:door
+    sequence:
+      - service: rest_command.portcullis_open
+        data: { door: 3 }
+  portcullis_open_door_4:
+    alias: "Open Door 4"
+    icon: mdi:door
+    sequence:
+      - service: rest_command.portcullis_open
+        data: { door: 4 }
+
+# The scripts appear as clickable buttons in HA and are callable from automations/voice.
+# A momentary unlock is a button/script, not a stateful lock. For live door OPEN/CLOSED sensor
+# state, read the controller via the REST API (http://10.48.200.67:8081/uhppote/device/223208728,
+# also firewall-allowed from HA) with a rest sensor if you want status tiles.

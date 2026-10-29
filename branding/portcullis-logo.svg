@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <!-- Portcullis emblem: iron gate lattice under a stone arch -->
+  <g fill="none" stroke="#e0b23b" stroke-width="11" stroke-linecap="round" stroke-linejoin="round">
+    <!-- arch frame -->
+    <path d="M70 360 L70 150 A130 130 0 0 1 330 150 L330 360" />
+    <!-- vertical bars -->
+    <line x1="112" y1="96"  x2="112" y2="360"/>
+    <line x1="156" y1="70"  x2="156" y2="360"/>
+    <line x1="200" y1="60"  x2="200" y2="360"/>
+    <line x1="244" y1="70"  x2="244" y2="360"/>
+    <line x1="288" y1="96"  x2="288" y2="360"/>
+    <!-- horizontal bars -->
+    <line x1="80"  y1="175" x2="320" y2="175"/>
+    <line x1="72"  y1="245" x2="328" y2="245"/>
+    <line x1="70"  y1="315" x2="330" y2="315"/>
+  </g>
+  <!-- spikes -->
+  <g fill="#e0b23b">
+    <polygon points="112,360 100,360 112,386 124,360"/>
+    <polygon points="156,360 144,360 156,386 168,360"/>
+    <polygon points="200,360 188,360 200,386 212,360"/>
+    <polygon points="244,360 232,360 244,386 256,360"/>
+    <polygon points="288,360 276,360 288,386 300,360"/>
+  </g>
+</svg>
