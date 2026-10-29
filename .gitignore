@@ -1,0 +1,14 @@
+# Sensitive — door credentials / captures. Gitea-internal only, never GitHub.
+*.mdb
+*.accdb
+*.bak
+*.pcap
+*.pcapng
+cards*
+secrets*
+private/
+
+# junk
+*.tmp
+.DS_Store
+Thumbs.db
