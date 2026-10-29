@@ -23,8 +23,11 @@ VAR_DIR="/var/uhppoted"
 LOG_DIR="/var/log/uhppoted"
 BIN_DIR="/usr/local/bin"
 GO_ROOT="/usr/local/go"
-SERVICES="uhppoted-httpd uhppoted-rest uhppoted-mqtt"
+SERVICES="uhppoted-httpd uhppoted-rest uhppoted-mqtt portcullis-doorctl"
 BINARIES="uhppote-cli uhppoted-rest uhppoted-httpd uhppoted-mqtt"
+PORTCULLIS_DIR="/opt/portcullis"
+PORTCULLIS_ETC="/etc/portcullis"
+PORTCULLIS_LOG="/var/log/portcullis"
 
 log() { printf '\e[36m[uninstall]\e[0m %s\n' "$*"; }
 die() { printf '\e[31m[error]\e[0m %s\n' "$*" >&2; exit 1; }
@@ -52,8 +55,8 @@ systemctl daemon-reload 2>/dev/null || true
 # ─── binaries + build tree ───────────────────────────────────────────────────
 for b in $BINARIES; do rm -f "$BIN_DIR/$b"; done
 log "removed binaries from $BIN_DIR"
-rm -rf "$SRC_PARENT"
-log "removed build tree $SRC_PARENT"
+rm -rf "$SRC_PARENT" "$PORTCULLIS_DIR"
+log "removed build tree $SRC_PARENT and door shim $PORTCULLIS_DIR"
 
 # ─── optional: Go toolchain ──────────────────────────────────────────────────
 if [ "$PURGE_GO" = "1" ]; then
@@ -63,8 +66,8 @@ fi
 
 # ─── optional: config, data, user ────────────────────────────────────────────
 if [ "$PURGE" = "1" ]; then
-  log "PURGE: removing config, data, logs and service user..."
-  rm -rf "$ETC_DIR" "$VAR_DIR" "$LOG_DIR"
+  log "PURGE: removing config, data, logs, shim token/log and service user..."
+  rm -rf "$ETC_DIR" "$VAR_DIR" "$LOG_DIR" "$PORTCULLIS_ETC" "$PORTCULLIS_LOG"
   if id "$UHPPOTED_USER" >/dev/null 2>&1; then userdel "$UHPPOTED_USER" 2>/dev/null || true; fi
   printf '\e[32m[done]\e[0m fully removed (including config + cardholder/web database).\n'
 else
