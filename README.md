@@ -1,6 +1,6 @@
-# Door Access Control
+# Portcullis — Door Access Control
 
-Control system for the 4-door access controller at **10.48.200.61:60000**, replacing the dead OEM
+**Portcullis** is the control system for the 4-door access controller at **10.48.200.61:60000**, replacing the dead OEM
 software *iCCard / "Contactless Cards Management System [Access Control & Attendance] V6.9"*
 (vendor szwgcn.com, Shenzhen).
 
@@ -22,6 +22,11 @@ Web-driven service on a dedicated Ubuntu VM, built on uhppoted:
 | `uhppote-cli` | Scripting + the card migration load |
 
 Integrations: Blair HQ dashboard tile, Home Assistant (4 door entities), JARVIS voice control.
+
+## Deployment
+- **VM:** `portcullis` (Ubuntu) on the Proxmox cluster.
+- **Public URL:** `https://portcullis.tomtomenterprises.com` — Cloudflare-proxied, reverse-proxied by NPM to the VM's `uhppoted-httpd`.
+- **Gated access (internet-facing):** Cloudflare Access (Zero Trust — email/SSO) in front, **plus** the app's own login = defense in depth. Direct controller comms stay LAN-only.
 
 ## Repo layout
 ```
