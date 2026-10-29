@@ -19,7 +19,7 @@
 #   --serial N            controller serial number        (default 223208728)
 #   --controller IP       controller IP                   (default 10.48.200.61)
 #   --doors "A,B,C,D"     names for doors 1..4            (default "Door1,Door2,Door3,Door4")
-#   --http-port PORT      web UI https port               (default 8443)
+#   --http-port PORT      web UI http port (TLS on proxy)  (default 8080)
 #   --broadcast IP:PORT   UDP broadcast for discovery      (default 10.48.200.255:60000)
 #   --listen IP:PORT      UDP listen for controller events (default 0.0.0.0:60001)
 #   --mqtt-broker URL     enable MQTT bridge to this broker e.g. tcp://10.48.200.97:1883
@@ -34,7 +34,7 @@ set -euo pipefail
 SERIAL="223208728"
 CONTROLLER="10.48.200.61"
 DOORS="Door1,Door2,Door3,Door4"
-HTTP_PORT="8443"
+HTTP_PORT="8080"
 BROADCAST="10.48.200.255:60000"
 LISTEN="0.0.0.0:60001"
 MQTT_BROKER=""
@@ -123,11 +123,16 @@ for c in $COMPONENTS; do
   log "building $c..."
   ( cd "$SRC_DIR/$c" && GOBIN="$BIN_DIR" go install -trimpath ./... )
 done
-# uhppoted-httpd ships web assets; recent builds embed them, but copy the tree as a fallback.
-if [ -d "$SRC_DIR/uhppoted-httpd/httpd/html" ]; then
-  mkdir -p "$VAR_DIR/httpd"
-  cp -r "$SRC_DIR/uhppoted-httpd/httpd/html" "$VAR_DIR/httpd/" 2>/dev/null || true
-fi
+# uhppoted-httpd needs a scaffold beyond the binary: web assets + grule rule files + seed data
+# (system/*.json) + auth.json. Lay down the distribution's example set (docker/compose). The admin
+# user is created on first web login via the setup page.
+install -d "$VAR_DIR/httpd/html" "$VAR_DIR/httpd/system" "$ETC_DIR/httpd/grules"
+[ -d "$SRC_DIR/uhppoted-httpd/httpd/html" ] && cp -r "$SRC_DIR/uhppoted-httpd/httpd/html/." "$VAR_DIR/httpd/html/" 2>/dev/null || true
+HS="$SRC_DIR/uhppoted-httpd/docker/compose"
+cp "$HS"/system/*.json "$VAR_DIR/httpd/system/" 2>/dev/null || true
+cp "$HS"/grules/*.grl  "$ETC_DIR/httpd/grules/" 2>/dev/null || true
+cp "$HS/acl.grl"   "$ETC_DIR/httpd/" 2>/dev/null || true
+cp "$HS/auth.json" "$ETC_DIR/httpd/" 2>/dev/null || true
 log "installed: $(ls $BIN_DIR | grep -E 'uhppot' | tr '\n' ' ')"
 
 # ─── 5. configuration ────────────────────────────────────────────────────────
@@ -153,13 +158,22 @@ rest.cors.enabled = false
 mqtt.broker = ${MQTT_BROKER:-tcp://127.0.0.1:1883}
 mqtt.topic.root = uhppoted
 
-# HTTPD
+# HTTPD (serves plain HTTP; put TLS on a reverse proxy in front)
 httpd.html = $VAR_DIR/httpd/html
-httpd.http.enabled = false
-httpd.https.enabled = true
-httpd.https.port = $HTTP_PORT
+httpd.http.enabled = true
+httpd.http.port = $HTTP_PORT
+httpd.https.enabled = false
 httpd.security.auth = basic
-httpd.db.file = $VAR_DIR/httpd/db/system
+httpd.security.local.db = $ETC_DIR/httpd/auth.json
+httpd.db.rules.acl = $ETC_DIR/httpd/acl.grl
+httpd.db.rules.interfaces = $ETC_DIR/httpd/grules/interfaces.grl
+httpd.db.rules.controllers = $ETC_DIR/httpd/grules/controllers.grl
+httpd.db.rules.cards = $ETC_DIR/httpd/grules/cards.grl
+httpd.db.rules.doors = $ETC_DIR/httpd/grules/doors.grl
+httpd.db.rules.groups = $ETC_DIR/httpd/grules/groups.grl
+httpd.db.rules.events = $ETC_DIR/httpd/grules/events.grl
+httpd.db.rules.logs = $ETC_DIR/httpd/grules/logs.grl
+httpd.db.rules.users = $ETC_DIR/httpd/grules/users.grl
 
 # DEVICES
 UT0311-L0x.$SERIAL.address = $CONTROLLER:60000
@@ -169,7 +183,7 @@ UT0311-L0x.$SERIAL.door.3 = $D3
 UT0311-L0x.$SERIAL.door.4 = $D4
 EOF
 chown -R "$UHPPOTED_USER:$UHPPOTED_USER" "$VAR_DIR" "$LOG_DIR" "$ETC_DIR"
-chmod 640 "$ETC_DIR/uhppoted.conf"
+chmod 644 "$ETC_DIR/uhppoted.conf"   # no secrets (device address/door names); CLI needs to read it
 
 # ─── 6. systemd units ────────────────────────────────────────────────────────
 mk_unit() {  # name  binary  args  description
@@ -186,11 +200,13 @@ Group=$UHPPOTED_USER
 ExecStart=$BIN_DIR/$2 $3
 Restart=on-failure
 RestartSec=5
+WorkingDirectory=$VAR_DIR
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-ProtectSystem=strict
+ProtectSystem=full
 ReadWritePaths=$VAR_DIR $LOG_DIR
 ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -225,7 +241,7 @@ cat <<EOF
 
 $(printf '\e[32m[done]\e[0m') uhppoted door access control installed.
 
-  Web UI : https://${ip:-<this-host>}:$HTTP_PORT
+  Web UI : http://${ip:-<this-host>}:$HTTP_PORT   (put TLS on a reverse proxy in front for remote access)
   Verify : uhppote-cli --config $ETC_DIR/uhppoted.conf get-devices   (expect serial $SERIAL)
   Status : systemctl status $svcs
   Logs   : journalctl -u uhppoted-httpd -f
