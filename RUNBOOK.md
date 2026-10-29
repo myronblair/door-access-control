@@ -20,6 +20,14 @@ Door access control for the 4-door UHPPOTE panel, replacing the dead iCCard v6.9
 - **Read status/cards:** `uhppote-cli … get-status 223208728` / `get-cards 223208728`.
 - **Manage cardholders:** the web UI (syncs from the controller).
 - **Cards today:** 7 enrolled on the panel, all Door 1+2 only (D3/D4 unused). Export: `/var/uhppoted/migration/panel-cards.txt`. No cardholder names exist (the panel never stored them; the old mdb was empty).
+- **Card type:** **125 kHz EM4100** proximity cards/fobs (confirmed from a real swipe event + the sequential-batch hex pattern `0154xxxx`). Readers output the **full card ID (Wiegand-34)**. Buy UHPPOTE 125 kHz EM4100/TK4100 cards — test one pack first.
+
+### Enroll a new card (reliable method, matches the readers' format)
+1. Tap the new card at any **door reader** (it'll be denied — that's expected).
+2. Read the exact number the controller just recorded — in the web UI **Events**, or `uhppote-cli --config /etc/uhppoted/uhppoted.conf get-event 223208728`.
+3. Add that number to a cardholder in the web UI (with door access + validity dates).
+
+A USB 125 kHz reader (e.g. UHPPOTE B014SACF9Q) also works for desk enrollment, but confirm it reports the same full number before trusting it for a batch.
 
 ## Integrations
 - **Home Assistant:** `integrations/home-assistant.yaml` (rest_command + door scripts calling the shim). HA (.97) is firewall-allowed. Needs the shim token in HA `secrets.yaml`.
@@ -45,7 +53,7 @@ Door access control for the 4-door UHPPOTE panel, replacing the dead iCCard v6.9
 ## Pending / decisions
 - **Door names** — confirm which physical door is 1/2/3/4 (improves HA/JARVIS phrasing). Only 1+2 are in use.
 - **HA activation** — paste `integrations/home-assistant.yaml` (HA has no non-interactive SSH from here).
-- **JARVIS activation** — apply `integrations/jarvis.md` (prod code + DB + config).
+- **JARVIS voice — DONE**: `open_door` intent deployed (chat.php + kb_intents + config constants, PHP restarted); admin-gated; say "open door N". Calls the shim (firewall + /health verified). First real actuation = the after-hours test.
 - **First real door-open** — the after-hours actuation test (nothing has actuated a door yet).
 - **Phase B** — Attendance / Patrol / Meeting-sign / Hikvision camera modules (see the plan).
 

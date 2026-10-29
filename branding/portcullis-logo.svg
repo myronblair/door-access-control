@@ -1,25 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
-  <!-- Portcullis emblem: iron gate lattice under a stone arch -->
-  <g fill="none" stroke="#e0b23b" stroke-width="11" stroke-linecap="round" stroke-linejoin="round">
-    <!-- arch frame -->
-    <path d="M70 360 L70 150 A130 130 0 0 1 330 150 L330 360" />
-    <!-- vertical bars -->
-    <line x1="112" y1="96"  x2="112" y2="360"/>
-    <line x1="156" y1="70"  x2="156" y2="360"/>
-    <line x1="200" y1="60"  x2="200" y2="360"/>
-    <line x1="244" y1="70"  x2="244" y2="360"/>
-    <line x1="288" y1="96"  x2="288" y2="360"/>
-    <!-- horizontal bars -->
-    <line x1="80"  y1="175" x2="320" y2="175"/>
-    <line x1="72"  y1="245" x2="328" y2="245"/>
-    <line x1="70"  y1="315" x2="330" y2="315"/>
-  </g>
-  <!-- spikes -->
-  <g fill="#e0b23b">
-    <polygon points="112,360 100,360 112,386 124,360"/>
-    <polygon points="156,360 144,360 156,386 168,360"/>
-    <polygon points="200,360 188,360 200,386 212,360"/>
-    <polygon points="244,360 232,360 244,386 256,360"/>
-    <polygon points="288,360 276,360 288,386 300,360"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400" font-family="Lato, 'Segoe UI', system-ui, sans-serif">
+  <defs>
+    <linearGradient id="brass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f3d27a"/>
+      <stop offset="55%" stop-color="#e0b23b"/>
+      <stop offset="100%" stop-color="#b8841f"/>
+    </linearGradient>
+    <path id="topArc" d="M 66,206 A 136,136 0 0 1 334,206" fill="none"/>
+    <path id="botArc" d="M 330,210 A 132,132 0 0 1 70,210" fill="none"/>
+  </defs>
+
+  <!-- seal rings -->
+  <circle cx="200" cy="200" r="190" fill="none" stroke="url(#brass)" stroke-width="7"/>
+  <circle cx="200" cy="200" r="176" fill="none" stroke="url(#brass)" stroke-width="2" opacity=".7"/>
+
+  <!-- wordmark around the seal -->
+  <text fill="url(#brass)" font-size="40" font-weight="800" letter-spacing="7">
+    <textPath href="#topArc" startOffset="50%" text-anchor="middle">PORTCULLIS</textPath>
+  </text>
+  <text fill="url(#brass)" font-size="19" font-weight="700" letter-spacing="8" opacity=".92">
+    <textPath href="#botArc" startOffset="50%" text-anchor="middle">ACCESS CONTROL</textPath>
+  </text>
+  <!-- side separators -->
+  <g fill="url(#brass)"><circle cx="40" cy="200" r="4"/><circle cx="360" cy="200" r="4"/></g>
+
+  <!-- central shield crest (security, not a literal gate) -->
+  <g>
+    <path d="M200 96 L250 116 L250 190 Q250 236 200 262 Q150 236 150 190 L150 116 Z"
+          fill="#161d27" stroke="url(#brass)" stroke-width="6"/>
+    <!-- subtle lattice hint -->
+    <g stroke="url(#brass)" stroke-width="3" opacity=".55" stroke-linecap="round">
+      <line x1="178" y1="120" x2="178" y2="240"/>
+      <line x1="222" y1="120" x2="222" y2="240"/>
+      <line x1="158" y1="150" x2="242" y2="150"/>
+    </g>
+    <!-- keyhole -->
+    <g fill="url(#brass)">
+      <circle cx="200" cy="176" r="15"/>
+      <path d="M192 186 L208 186 L213 224 L187 224 Z"/>
+    </g>
   </g>
 </svg>
