@@ -6,8 +6,7 @@ software *iCCard / "Contactless Cards Management System [Access Control & Attend
 
 ## The hardware
 - 4-door controller, 2×12V power supply, Wiegand readers.
-- **UHPPOTE-family** controller — protocol is 64-byte packets over **UDP 60000**, fully implemented by
-  the open-source [uhppoted](https://github.com/uhppoted) suite.
+- **UHPPOTE-family** controller — protocol is 64-byte packets over **UDP 60000**.
 - Controller serial **223208728**, IP 10.48.200.61 / 255.255.255.0 / gw 10.48.200.1,
   MAC `00:57:0D:4D:E5:18`.
 
