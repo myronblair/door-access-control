@@ -24,5 +24,10 @@ grep -q "login #logo" "$HTML/css/uhppoted.css" || \
 # naming: uhppoted-httpd -> Portcullis in page titles/footer (NOT script paths)
 sed -i "s/uhppoted-httpd/Portcullis/g" "$HTML"/sys/*.html "$HTML"/index.html "$HTML"/templates/snippets.html 2>/dev/null || true
 
+# add an OPS link into the uhppoted nav so the Phase-B Ops app (/ops) is discoverable (idempotent)
+S="$HTML/templates/snippets.html"
+grep -q '/ops/">OPS' "$S" 2>/dev/null || \
+  sed -i '/\/sys\/users.html/a\          <li><a href="/ops/">OPS</a></li>' "$S" 2>/dev/null || true
+
 chown -R uhppoted:uhppoted "$HTML" 2>/dev/null || true
 echo "Portcullis branding applied to $HTML — restart uhppoted-httpd to reload templates."

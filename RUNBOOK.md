@@ -63,8 +63,10 @@ survives the controller flapping.
 - **Attendance** — live (per-card/day first/last/counts). CLI too: `report.py [--days N] [--json]`.
 - **Patrol / Meetings** — configurable in the UI (checkpoints/routes with time windows; meetings with a
   reader + window → attendance). Reports computed over the `events` table.
-- **Hikvision cameras** — config captured in the UI (IP/user/door/RTSP); snapshot-on-event via ISAPI
-  (`/ISAPI/Streaming/channels/101/picture`) is the next wiring step (needs the camera creds on the host).
+- **Hikvision cameras** — fully UI-configurable (IP / user / **password** / channel / door) with a **test**
+  button. The collector auto-grabs an ISAPI snapshot (`curl --digest`, `/ISAPI/Streaming/channels/<ch>/picture`)
+  on fresh events for a door with a linked camera; it shows on the Events page (📷). All config in the UI — no host steps.
+- **Discoverability** — an **OPS** link is added to the uhppoted nav, so `/ops` is reachable from the main UI.
 
 ## Pending / decisions
 - **Door names** — confirm which physical door is 1/2/3/4 (improves HA/JARVIS phrasing). Only 1+2 are in use.

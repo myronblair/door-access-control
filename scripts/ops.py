@@ -8,8 +8,8 @@ event history the collector maintains in SQLite and keeps its own config in the 
 Runs on :8083 (put behind the Cloudflare tunnel / Access like the main UI). Flask app.
 Copyright (c) 2026 TomTom Enterprises.
 """
-import os, sqlite3, datetime
-from flask import Flask, request, redirect, url_for, render_template_string
+import os, sqlite3, datetime, subprocess
+from flask import Flask, request, redirect, url_for, render_template_string, send_file
 
 DB  = os.environ.get("PORTCULLIS_DB", "/var/lib/portcullis/portcullis.db")
 app = Flask(__name__)
@@ -28,8 +28,12 @@ def db():
     CREATE TABLE IF NOT EXISTS meetings(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, door INTEGER,
         start_ts TEXT, end_ts TEXT);
     CREATE TABLE IF NOT EXISTS cameras(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, ip TEXT,
-        username TEXT, door INTEGER, rtsp TEXT);
+        username TEXT, door INTEGER, rtsp TEXT, password TEXT, channel TEXT DEFAULT '101');
+    CREATE TABLE IF NOT EXISTS snapshots(idx INTEGER PRIMARY KEY, path TEXT, camera TEXT, taken_at TEXT);
     """)
+    cols = [r[1] for r in c.execute("PRAGMA table_info(cameras)")]
+    if "password" not in cols: c.execute("ALTER TABLE cameras ADD COLUMN password TEXT")
+    if "channel"  not in cols: c.execute("ALTER TABLE cameras ADD COLUMN channel TEXT DEFAULT '101'")
     return c
 
 
@@ -105,14 +109,16 @@ def dashboard():
 def events():
     c = db(); days = int(request.args.get("days", 30))
     since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
-    evs = c.execute("SELECT * FROM events WHERE ts>=? ORDER BY idx DESC LIMIT 500", (since,)).fetchall()
+    evs = c.execute("""SELECT e.*, s.idx AS snap FROM events e LEFT JOIN snapshots s ON s.idx=e.idx
+                       WHERE e.ts>=? ORDER BY e.idx DESC LIMIT 500""", (since,)).fetchall()
+    cam = lambda e: (f"<a href='{url_for('snapshot', idx=e['idx'])}' target=_blank title='camera snapshot'>&#128247;</a>" if e['snap'] else "")
     rows = "".join(f"<tr><td>{e['idx']}</td><td>{e['ts']}</td><td>{e['card']}</td><td>{door_name(c,e['door'])}</td>"
                    f"<td class='{'g' if e['granted'] else 'r'}'>{'granted' if e['granted'] else 'denied'}</td>"
-                   f"<td>{e['event_type']}</td></tr>" for e in evs) or "<tr><td colspan=6 class=muted>none</td></tr>"
+                   f"<td>{e['event_type']}</td><td>{cam(e)}</td></tr>" for e in evs) or "<tr><td colspan=7 class=muted>none</td></tr>"
     body = f"""<h1>Events</h1>
     <form class=row method=get><div><label>show last (days)</label><input name=days value="{days}" size=5></div><button>Filter</button></form>
     <p class=muted>{len(evs)} events (most recent 500)</p>
-    <table><tr><th>#</th><th>Time</th><th>Card</th><th>Door</th><th>Result</th><th>Type</th></tr>{rows}</table>"""
+    <table><tr><th>#</th><th>Time</th><th>Card</th><th>Door</th><th>Result</th><th>Type</th><th>Cam</th></tr>{rows}</table>"""
     return page("events", "Events", body)
 
 
@@ -220,26 +226,58 @@ def cameras():
         if f.get("del"):
             c.execute("DELETE FROM cameras WHERE id=?", (f["del"],))
         else:
-            c.execute("INSERT INTO cameras(name,ip,username,door,rtsp) VALUES(?,?,?,?,?)",
-                      (f["name"], f["ip"], f["username"], f["door"], f["rtsp"]))
+            c.execute("INSERT INTO cameras(name,ip,username,password,door,channel,rtsp) VALUES(?,?,?,?,?,?,?)",
+                      (f["name"], f["ip"], f.get("username", "admin"), f.get("password", ""),
+                       f["door"], f.get("channel", "101") or "101", f.get("rtsp", "")))
         c.commit(); return redirect(url_for("cameras"))
     cams = c.execute("SELECT * FROM cameras ORDER BY name").fetchall()
     dsel = "".join(f"<option value={n}>{door_name(c,n)}</option>" for n in (1, 2, 3, 4))
-    rows = "".join(f"<tr><td>{m['name']}</td><td>{m['ip']}</td><td>{m['username']}</td><td>{door_name(c,m['door'])}</td>"
-                   f"<td class=muted>{m['rtsp'] or ''}</td>"
-                   f"<td><form method=post style=display:inline><input type=hidden name=del value={m['id']}>"
-                   f"<button class=del>delete</button></form></td></tr>" for m in cams) or "<tr><td colspan=6 class=muted>no cameras</td></tr>"
+    rows = "".join(
+        f"<tr><td>{m['name']}</td><td>{m['ip']}</td><td>{m['username']}</td>"
+        f"<td>{'&#9679; set' if m['password'] else '&mdash;'}</td><td>{m['channel'] or '101'}</td>"
+        f"<td>{door_name(c,m['door'])}</td>"
+        f"<td><a href='{url_for('camera_test', cid=m['id'])}' target=_blank>test</a></td>"
+        f"<td><form method=post style=display:inline><input type=hidden name=del value={m['id']}>"
+        f"<button class=del>delete</button></form></td></tr>" for m in cams) or "<tr><td colspan=8 class=muted>no cameras</td></tr>"
     body = f"""<h1>Cameras</h1>
-    <table><tr><th>Name</th><th>IP</th><th>User</th><th>Door</th><th>RTSP path</th><th></th></tr>{rows}</table>
-    <div class=card><h2>Add camera (Hikvision ISAPI/RTSP)</h2><form class=row method=post>
+    <p class=muted>Hikvision ISAPI. A camera linked to a door gets an auto-snapshot when that door fires an event (shown on the Events page with &#128247;).</p>
+    <table><tr><th>Name</th><th>IP</th><th>User</th><th>Pass</th><th>Ch</th><th>Door</th><th>Test</th><th></th></tr>{rows}</table>
+    <div class=card><h2>Add camera</h2><form class=row method=post>
       <div><label>name</label><input name=name required></div>
-      <div><label>IP</label><input name=ip placeholder="10.48.200.x"></div>
-      <div><label>username</label><input name=username placeholder="admin"></div>
+      <div><label>IP</label><input name=ip placeholder="10.48.200.x" required></div>
+      <div><label>username</label><input name=username value="admin"></div>
+      <div><label>password</label><input name=password type=password></div>
+      <div><label>channel</label><input name=channel value="101" size=5></div>
       <div><label>door</label><select name=door>{dsel}</select></div>
       <div><label>RTSP path (optional)</label><input name=rtsp placeholder="/Streaming/Channels/101"></div>
       <button>Add</button></form>
-      <p class=muted>Stored config; snapshot-on-event uses ISAPI (/ISAPI/Streaming/channels/101/picture). Password is held on the host, not shown here.</p></div>"""
+      <p class=muted>Snapshot URL: http://&lt;ip&gt;/ISAPI/Streaming/channels/&lt;ch&gt;/picture (digest auth). Click &ldquo;test&rdquo; after adding to verify the credentials.</p></div>"""
     return page("cameras", "Cameras", body)
+
+
+@app.route("/snapshot/<int:idx>")
+def snapshot(idx):
+    c = db()
+    r = c.execute("SELECT path FROM snapshots WHERE idx=?", (idx,)).fetchone()
+    if r and r["path"] and os.path.exists(r["path"]):
+        return send_file(r["path"], mimetype="image/jpeg")
+    return "no snapshot", 404
+
+
+@app.route("/cameras/test/<int:cid>")
+def camera_test(cid):
+    c = db()
+    m = c.execute("SELECT * FROM cameras WHERE id=?", (cid,)).fetchone()
+    if not m or not m["ip"]:
+        return "camera not found", 404
+    out = f"/tmp/cam_test_{cid}.jpg"
+    url = f"http://{m['ip']}/ISAPI/Streaming/channels/{m['channel'] or '101'}/picture"
+    r = subprocess.run(["curl", "-s", "--max-time", "8", "--digest",
+                        "-u", f"{m['username'] or 'admin'}:{m['password'] or ''}", url, "-o", out],
+                       capture_output=True)
+    if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1000:
+        return send_file(out, mimetype="image/jpeg")
+    return "snapshot failed — check IP / credentials / channel", 502
 
 
 @app.route("/settings", methods=["GET", "POST"])

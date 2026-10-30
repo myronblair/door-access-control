@@ -18,6 +18,8 @@ SERIAL = os.environ.get("PORTCULLIS_SERIAL", "223208728")
 CLI    = "/usr/local/bin/uhppote-cli"
 DB     = os.environ.get("PORTCULLIS_DB", "/var/lib/portcullis/portcullis.db")
 POLL   = int(os.environ.get("PORTCULLIS_POLL", "30"))
+SNAP_DIR     = os.environ.get("PORTCULLIS_SNAPSHOTS", "/var/lib/portcullis/snapshots")
+SNAP_MAX_AGE = 180   # only snapshot fresh events (never the historical backfill)
 
 
 def cli(*a, t=15):
@@ -32,7 +34,41 @@ def db():
         granted INTEGER, event_type INTEGER, raw TEXT, collected_at TEXT)""")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_card ON events(card)")
+    con.execute("""CREATE TABLE IF NOT EXISTS cameras(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT,
+        ip TEXT, username TEXT, door INTEGER, rtsp TEXT, password TEXT, channel TEXT DEFAULT '101')""")
+    con.execute("CREATE TABLE IF NOT EXISTS snapshots(idx INTEGER PRIMARY KEY, path TEXT, camera TEXT, taken_at TEXT)")
+    cols = [r[1] for r in con.execute("PRAGMA table_info(cameras)")]
+    if "password" not in cols: con.execute("ALTER TABLE cameras ADD COLUMN password TEXT")
+    if "channel"  not in cols: con.execute("ALTER TABLE cameras ADD COLUMN channel TEXT DEFAULT '101'")
     return con
+
+
+def maybe_snapshot(con, idx, door, ts):
+    """If a camera is linked to this door, grab a Hikvision ISAPI snapshot (curl digest) for fresh
+    events only. Stored under SNAP_DIR and recorded in `snapshots`. All config comes from the UI."""
+    try:
+        age = (datetime.datetime.now() - datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")).total_seconds()
+    except ValueError:
+        return
+    if age > SNAP_MAX_AGE:
+        return
+    cam = con.execute("SELECT ip, username, password, channel FROM cameras WHERE door=? AND ip!='' LIMIT 1",
+                      (door,)).fetchone()
+    if not cam or not cam[0]:
+        return
+    ip, user, pw, ch = cam[0], cam[1] or "admin", cam[2] or "", cam[3] or "101"
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    path = os.path.join(SNAP_DIR, f"{idx}.jpg")
+    url = f"http://{ip}/ISAPI/Streaming/channels/{ch}/picture"
+    r = subprocess.run(["curl", "-s", "--max-time", "8", "--digest", "-u", f"{user}:{pw}", url, "-o", path],
+                       capture_output=True)
+    if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 1000:
+        con.execute("INSERT OR REPLACE INTO snapshots(idx, path, camera, taken_at) VALUES(?,?,?,?)",
+                    (idx, path, ip, datetime.datetime.now().isoformat(timespec="seconds")))
+        con.commit()
+    else:
+        try: os.remove(path)
+        except OSError: pass
 
 
 def bounds():
@@ -76,6 +112,10 @@ def poll(con):
         if row:
             con.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?,?)", (*row, now))
             n += 1
+            try:
+                maybe_snapshot(con, row[0], row[3], row[1])   # idx, door, ts
+            except Exception:
+                pass
     con.commit()
     return n
 
