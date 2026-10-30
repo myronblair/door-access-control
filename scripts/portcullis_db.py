@@ -53,6 +53,42 @@ def connect(row_factory=None):
     return con
 
 
+CLI = "/usr/local/bin/uhppote-cli"
+
+
+def cli(conf, *args, timeout=15):
+    """Run uhppote-cli against a config; returns (returncode, combined output)."""
+    r = subprocess.run([CLI, "--config", conf, *args], capture_output=True, text=True, timeout=timeout)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def configured_controllers(conf):
+    """Serials already declared in uhppoted.conf -> IP."""
+    out = {}
+    try:
+        for line in open(conf):
+            m = re.match(r"\s*UT0311-L0x\.(\d+)\.address\s*=\s*([\d.]+)", line)
+            if m:
+                out[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return out
+
+
+def discover(conf):
+    """Broadcast-discover UHPPOTE controllers on the LAN (get-devices). Returns a list of dicts."""
+    _, out = cli(conf, "get-devices")
+    found = []
+    for line in out.splitlines():
+        p = line.split()                           # serial ip mask gw mac version date
+        if len(p) >= 2 and p[0].isdigit():
+            found.append({"serial": p[0], "ip": p[1],
+                          "mask": p[2] if len(p) > 2 else "", "gw": p[3] if len(p) > 3 else "",
+                          "mac": p[4] if len(p) > 4 else "", "version": p[5] if len(p) > 5 else "",
+                          "date": p[6] if len(p) > 6 else ""})
+    return found
+
+
 def attendance(con, days=30):
     """Per-card, per-day first/last seen + counts over the last `days` days."""
     since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()

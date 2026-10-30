@@ -325,6 +325,13 @@ if [ -f "$HERE/ops.py" ]; then
   "$PORTCULLIS_DIR/venv/bin/python" -c 'import flask' 2>/dev/null \
     || warn "Flask is not importable in $PORTCULLIS_DIR/venv — portcullis-ops will not start (try: $PORTCULLIS_DIR/venv/bin/pip install flask)"
   install -m755 "$HERE/ops.py" "$PORTCULLIS_DIR/ops.py"
+  # privileged helper for the Controllers "Discover + Add" flow: root-owned, restricted sudo
+  if [ -f "$HERE/add-controller.sh" ]; then
+    install -m755 -o root -g root "$HERE/add-controller.sh" /usr/local/sbin/portcullis-add-controller
+    echo "$UHPPOTED_USER ALL=(root) NOPASSWD: /usr/local/sbin/portcullis-add-controller" > /tmp/pc-sudoers
+    visudo -cf /tmp/pc-sudoers && install -m440 -o root -g root /tmp/pc-sudoers /etc/sudoers.d/portcullis
+    rm -f /tmp/pc-sudoers
+  fi
   install -m644 "$HERE/portcullis_db.py" "$PORTCULLIS_DIR/portcullis_db.py"
   install -d -m700 -o "$UHPPOTED_USER" -g "$UHPPOTED_USER" /var/lib/portcullis
   chown -R "$UHPPOTED_USER:$UHPPOTED_USER" "$PORTCULLIS_DIR"

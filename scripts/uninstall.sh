@@ -54,6 +54,8 @@ systemctl daemon-reload 2>/dev/null || true
 # nginx front for the ops app
 rm -f /etc/nginx/sites-enabled/portcullis /etc/nginx/sites-available/portcullis
 systemctl reload nginx 2>/dev/null || true
+# privileged add-controller helper + its sudo rule
+rm -f /usr/local/sbin/portcullis-add-controller /etc/sudoers.d/portcullis
 
 # ─── binaries + build tree ───────────────────────────────────────────────────
 for b in $BINARIES; do rm -f "$BIN_DIR/$b"; done

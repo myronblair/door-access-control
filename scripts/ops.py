@@ -15,12 +15,14 @@ Security:
 
 Copyright (c) 2026 TomTom Enterprises.
 """
-import os, re, datetime
+import os, re, datetime, subprocess
 from urllib.parse import urlsplit
 from flask import Flask, request, redirect, url_for, render_template_string, send_file, g, abort
 from markupsafe import escape
 
 import portcullis_db as pdb
+
+CONF = os.environ.get("PORTCULLIS_CONF", "/etc/uhppoted/uhppoted.conf")
 
 SNAP_DIR = os.path.realpath(os.environ.get("PORTCULLIS_SNAPSHOTS", "/var/lib/portcullis/snapshots"))
 AUTH     = os.environ.get("PORTCULLIS_OPS_AUTH", "access").lower()
@@ -153,7 +155,7 @@ button.del{background:#3a1f22;color:#e5484d;padding:5px 10px;font-weight:700}
 </nav><main>{% if err %}<p class=err>{{err}}</p>{% endif %}{{ body|safe }}</main></body></html>"""
 
 PAGES = [("dashboard", "Dashboard"), ("events", "Events"), ("attendance", "Attendance"),
-         ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"), ("settings", "Settings")]
+         ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"), ("controllers", "Controllers"), ("settings", "Settings")]
 
 
 def page(active, title, body):
@@ -386,6 +388,46 @@ def settings():
     <div class=card><h2>Listener guard (anti phone-home)</h2>
       <p class=muted>Controlled by the door-control service on :8082 — <code>/guard/on</code>, <code>/guard/off</code>, <code>/guard/enforce</code> (Bearer token). Currently enforced to this host.</p></div>"""
     return page("settings", "Settings", body)
+
+
+@app.route("/controllers", methods=["GET", "POST"])
+def controllers():
+    if request.method == "POST":                       # add a discovered controller
+        serial, ip = request.form.get("serial", "").strip(), request.form.get("ip", "").strip()
+        if serial.isdigit() and re.match(r"^[0-9.]+$", ip):
+            try:
+                subprocess.run(["sudo", "/usr/local/sbin/portcullis-add-controller", serial, ip], timeout=40)
+            except Exception:
+                pass
+        return redirect(url_for("controllers"))
+    cfg = pdb.configured_controllers(CONF)
+    disc = pdb.discover(CONF) if request.args.get("discover") else None
+    crows = "".join(f"<tr><td>{escape(s)}</td><td>{escape(ip)}</td><td class=g>configured</td></tr>"
+                    for s, ip in cfg.items()) or "<tr><td colspan=3 class=muted>none</td></tr>"
+    disc_html = "<p class=muted>Click to broadcast-scan the LAN for UHPPOTE controllers.</p>"
+    if disc is not None:
+        drows = ""
+        for d in disc:
+            new = d["serial"] not in cfg
+            act = ((f"<form method=post style=display:inline>"
+                    f"<input type=hidden name=serial value='{escape(d['serial'])}'>"
+                    f"<input type=hidden name=ip value='{escape(d['ip'])}'><button>Add</button></form>")
+                   if new else "<span class=muted>already added</span>")
+            drows += (f"<tr><td>{escape(d['serial'])}</td><td>{escape(d['ip'])}</td>"
+                      f"<td>{escape(d['version'])}</td><td>{escape(d['mac'])}</td>"
+                      f"<td class='{'r' if new else 'g'}'>{'NEW' if new else 'configured'}</td><td>{act}</td></tr>")
+        drows = drows or "<tr><td colspan=6 class=muted>no controllers answered the broadcast</td></tr>"
+        disc_html = ("<table><tr><th>Serial</th><th>IP</th><th>Version</th><th>MAC</th>"
+                     "<th>Status</th><th></th></tr>" + drows + "</table>")
+    body = f"""<h1>Controllers</h1>
+    <div class=card><h2>Configured</h2>
+      <table><tr><th>Serial</th><th>IP</th><th>Status</th></tr>{crows}</table></div>
+    <div class=card><h2>Network discovery</h2>
+      <form method=get><input type=hidden name=discover value=1><button>Discover on network</button></form>
+      {disc_html}
+      <p class=muted>Adding a controller appends it to the config and reloads the web UI + REST; it gets
+      generic door names you can rename afterward.</p></div>"""
+    return page("controllers", "Controllers", body)
 
 
 if __name__ == "__main__":
