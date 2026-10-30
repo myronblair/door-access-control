@@ -54,12 +54,17 @@ A USB 125 kHz reader (e.g. UHPPOTE B014SACF9Q) also works for desk enrollment, b
 Built on a shared **event pipeline**: `portcullis-collector` polls the controller's event buffer into
 SQLite (`/var/lib/portcullis/portcullis.db`, table `events`) every 30s — durable, backfills history,
 survives the controller flapping.
-- **Event pipeline** — DONE (`scripts/collector.py`, service `portcullis-collector`; 18 historical events captured).
-- **Attendance** — DONE (core): `scripts/report.py` → per-card, per-day first-seen/last-seen/counts.
-  `sudo -u uhppoted python3 /opt/portcullis/report.py [--days N] [--json]`.
-- **Patrol / Meeting-sign** — TODO: need your definitions (which readers are patrol checkpoints + routes/schedules; meeting list). Both are queries over the same `events` table.
-- **Hikvision cameras** — TODO: via ISAPI/RTSP on Linux (needs camera IPs + creds); link a camera to a door, snapshot on event.
-- **Web views** — TODO: attendance/patrol are CLI/JSON today; surfacing them in the gated web UI needs a small page served behind the Cloudflare tunnel.
+- **Ops web app** (`scripts/ops.py`, service `portcullis-ops`, Flask) — the Phase-B UI, **built into the
+  same gated URL at `/ops`**. nginx fronts :8080 (what the tunnel hits): `/` → the uhppoted access UI
+  (moved to :8088 internally), `/ops` → this app. Same Cloudflare Access gate, one login.
+  **Pages:** Dashboard · Events · Attendance · Patrol · Meetings · Cameras · **Settings** — each module is
+  configured in the UI (no code): patrol checkpoints + routes, meetings, cameras, door names.
+- **Event pipeline** — DONE (`scripts/collector.py`, `portcullis-collector`; events → SQLite).
+- **Attendance** — live (per-card/day first/last/counts). CLI too: `report.py [--days N] [--json]`.
+- **Patrol / Meetings** — configurable in the UI (checkpoints/routes with time windows; meetings with a
+  reader + window → attendance). Reports computed over the `events` table.
+- **Hikvision cameras** — config captured in the UI (IP/user/door/RTSP); snapshot-on-event via ISAPI
+  (`/ISAPI/Streaming/channels/101/picture`) is the next wiring step (needs the camera creds on the host).
 
 ## Pending / decisions
 - **Door names** — confirm which physical door is 1/2/3/4 (improves HA/JARVIS phrasing). Only 1+2 are in use.

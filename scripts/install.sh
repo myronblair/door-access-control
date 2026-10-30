@@ -312,6 +312,59 @@ EOF
   systemctl daemon-reload
 fi
 
+# ─── 8c. Ops web app (Phase B) behind nginx on the same URL (/ops) ────────────
+if [ -f "$HERE/ops.py" ]; then
+  log "installing Portcullis Ops web app + nginx front (web UI at /, ops at /ops)..."
+  command -v nginx >/dev/null 2>&1 || apt-get install -y -qq nginx >/dev/null
+  if [ ! -x "$PORTCULLIS_DIR/venv/bin/python" ]; then
+    apt-get install -y -qq python3-venv >/dev/null
+    python3 -m venv "$PORTCULLIS_DIR/venv"
+    "$PORTCULLIS_DIR/venv/bin/pip" install -q flask >/dev/null 2>&1
+  fi
+  install -m755 "$HERE/ops.py" "$PORTCULLIS_DIR/ops.py"
+  install -d -o "$UHPPOTED_USER" -g "$UHPPOTED_USER" /var/lib/portcullis
+  chown -R "$UHPPOTED_USER:$UHPPOTED_USER" "$PORTCULLIS_DIR"
+  cat > /etc/systemd/system/portcullis-ops.service <<EOF
+[Unit]
+Description=Portcullis Ops (Phase B web app)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$UHPPOTED_USER
+Group=$UHPPOTED_USER
+Environment=PORTCULLIS_OPS_PREFIX=/ops
+Environment=PORTCULLIS_OPS_PORT=8083
+ExecStart=$PORTCULLIS_DIR/venv/bin/python $PORTCULLIS_DIR/ops.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/portcullis
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  # uhppoted-httpd moves to :8088 (internal); nginx fronts $HTTP_PORT (what the tunnel hits)
+  sed -i 's/^httpd.http.port = .*/httpd.http.port = 8088/' "$ETC_DIR/uhppoted.conf"
+  cat > /etc/nginx/sites-available/portcullis <<NG
+server {
+  listen $HTTP_PORT default_server;
+  server_name _;
+  location = /ops { return 302 /ops/; }
+  location /ops/ { proxy_pass http://127.0.0.1:8083; proxy_set_header Host \$host; proxy_set_header X-Forwarded-For \$remote_addr; }
+  location / { proxy_pass http://127.0.0.1:8088; proxy_set_header Host \$host; proxy_set_header X-Forwarded-For \$remote_addr; }
+}
+NG
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sf /etc/nginx/sites-available/portcullis /etc/nginx/sites-enabled/portcullis
+  systemctl daemon-reload
+  systemctl restart nginx 2>/dev/null || true
+fi
+
 # ─── 9. firewall — lock REST + door shim to the integration hosts only ────────
 if command -v ufw >/dev/null 2>&1; then
   log "configuring firewall (ufw): SSH + controller events open; REST/$REST_PORT + shim/$SHIM_PORT limited to integrations..."
@@ -331,6 +384,7 @@ svcs="uhppoted-httpd uhppoted-rest"
 [ -n "$MQTT_BROKER" ] && svcs="$svcs uhppoted-mqtt"
 [ -f "$HERE/doorctl.py" ] && svcs="$svcs portcullis-doorctl"
 [ -f "$HERE/collector.py" ] && svcs="$svcs portcullis-collector"
+[ -f "$HERE/ops.py" ] && svcs="$svcs portcullis-ops"
 if [ "$START" = "1" ]; then
   log "enabling + starting services..."
   for s in $svcs; do systemctl enable --now "$s" >/dev/null 2>&1 || warn "$s failed to start (check: journalctl -u $s)"; done
