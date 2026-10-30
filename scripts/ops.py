@@ -40,6 +40,15 @@ def meta_set(c, k, v):
     c.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
 
 
+def setting_get(c, k, default=""):
+    r = c.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
+    return r[0] if r and r[0] is not None else default
+
+
+def setting_set(c, k, v):
+    c.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
+
 def h(v):
     """HTML-escape any value for interpolation into the page body."""
     return str(escape("" if v is None else v))
@@ -86,6 +95,14 @@ def audit(action, detail=""):
                      (datetime.datetime.now().isoformat(timespec="seconds"), getattr(g, "who", "unknown"),
                       action[:60], str(detail)[:300]))
         db().commit()
+    except Exception:
+        pass
+
+
+def reload_httpd():
+    """Restart uhppoted-httpd so it reloads the system JSON stores Ops just wrote to."""
+    try:
+        subprocess.run(["sudo", "/usr/local/sbin/portcullis-reload-httpd"], timeout=40)
     except Exception:
         pass
 
@@ -218,9 +235,9 @@ button.del{background:#3a1f22;color:#e5484d;padding:5px 10px;font-weight:700}
 </nav><main>{% if err %}<p class=err>{{err}}</p>{% endif %}{{ body|safe }}</main></body></html>"""
 
 PAGES = [("dashboard", "Dashboard"), ("events", "Events"), ("attendance", "Attendance"),
-         ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"),
-         ("devices", "Devices"), ("controllers", "Controllers"), ("sync", "Sync"),
-         ("logs", "Logs"), ("settings", "Settings")]
+         ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"), ("devices", "Devices"),
+         ("doors", "Doors"), ("cards", "Cards"), ("groups", "Groups"), ("users", "Users"),
+         ("controllers", "Controllers"), ("sync", "Sync"), ("logs", "Logs"), ("settings", "Settings")]
 
 
 def sync_badge():
@@ -530,6 +547,229 @@ def camera_test(cid):
     if jpg:
         return app.response_class(jpg, mimetype="image/jpeg")
     return "snapshot failed — check IP / credentials / channel", 502
+
+
+@app.route("/doors", methods=["GET", "POST"])
+def doors():
+    db()
+    cfg = pdb.configured_controllers(CONF)
+    names = known_controllers()
+    if request.method == "POST":
+        f = request.form
+        serial, pos = f.get("serial", "").strip(), f.get("pos", "").strip()
+        if serial not in cfg or not valid_door(pos):
+            return bad("doors", "Pick a controller and a door 1-4.")
+        name = f.get("name", "").strip() or f"Door {pos}"
+        mode, delay = f.get("mode", "controlled"), f.get("delay", "5").strip()
+        oid = pdb.ensure_door_oid(serial, int(pos), name)
+        if oid:
+            pdb.save_door(oid, name, f.get("keypad") == "on")
+        if mode in ("controlled", "normally open", "normally closed"):
+            pdb.cli(CONF, "set-door-control", serial, pos, mode, timeout=12)
+        if delay.isdigit():
+            pdb.cli(CONF, "set-door-delay", serial, pos, delay, timeout=12)
+        audit("edit door", f"{serial} d{pos} {name}"); reload_httpd()
+        return redirect(url_for("doors"))
+    et = request.args.get("edit", "")
+    es, _, ep = et.partition(":")
+    blocks = ""
+    for serial in cfg:
+        dn, km, idoors = pdb.door_names(serial), pdb.door_keypads(serial), pdb.intended_doors(serial)
+        rows = ""
+        for n in (1, 2, 3, 4):
+            info = idoors.get(n, {})
+            rows += (f"<tr><td>{n}</td><td>{h(dn.get(n))}</td><td>{h(info.get('mode', '—'))}</td>"
+                     f"<td>{info.get('delay', '—')}</td><td>{'yes' if n in km else '—'}</td>"
+                     f"<td><a class=editlink href='?edit={escape(serial)}:{n}'>edit</a></td></tr>")
+        blocks += (f"<div class=card><h2>{h(names.get(serial, serial))}</h2><table>"
+                   f"<tr><th>#</th><th>Name</th><th>Mode</th><th>Delay</th><th>Keypad</th><th></th></tr>{rows}</table></div>")
+    form = ""
+    if es in cfg and ep in ("1", "2", "3", "4"):
+        dn, info, km = pdb.door_names(es), pdb.intended_doors(es).get(int(ep), {}), pdb.door_keypads(es)
+        msel = "".join(f"<option value='{m}'{' selected' if info.get('mode') == m else ''}>{m}</option>"
+                       for m in ("controlled", "normally open", "normally closed"))
+        form = f"""<div class=card><h2>Edit door {ep} — {h(names.get(es, es))}</h2><form class=row method=post>
+          <input type=hidden name=serial value='{escape(es)}'><input type=hidden name=pos value='{escape(ep)}'>
+          <div><label>name</label><input name=name value="{h(dn.get(int(ep)))}"></div>
+          <div><label>mode</label><select name=mode>{msel}</select></div>
+          <div><label>delay (s)</label><input name=delay size=4 value="{info.get('delay', '5')}"></div>
+          <div><label>&nbsp;</label><label style='display:inline'><input type=checkbox name=keypad {'checked' if int(ep) in km else ''}> keypad</label></div>
+          <button>Save</button> <a href='{url_for('doors')}' style='align-self:center;color:var(--muted)'>cancel</a></form>
+          <p class=muted>Name &amp; keypad save to the Access UI store; mode &amp; delay are pushed to the panel immediately.</p></div>"""
+    body = (f"<h1>Doors</h1><p class=muted>Each controller's four doors. Name &amp; keypad live in the Access UI store; "
+            f"mode &amp; delay are written straight to the panel. Click edit.</p>{blocks}{form}")
+    return page("doors", "Doors", body)
+
+
+@app.route("/cards", methods=["GET", "POST"])
+def cards():
+    db()
+    cfg = pdb.configured_controllers(CONF)
+    names = known_controllers()
+    serial = request.args.get("serial") or (next(iter(cfg)) if cfg else "")
+    if request.method == "POST":
+        f = request.form
+        s, num = f.get("serial", "").strip(), f.get("card", "").strip()
+        if s not in cfg:
+            return bad("cards", "Unknown controller.")
+        if not num.isdigit():
+            return bad("cards", "Card number must be numeric.")
+        if f.get("action") == "delete":
+            pdb.cli(CONF, "delete-card", s, num, timeout=12)
+            pdb.delete_card_record(num); audit("delete card", f"{s} {num}"); reload_httpd()
+            return redirect(url_for("cards", serial=s))
+        frm = f.get("from", "").strip() or "2000-01-01"
+        to = f.get("to", "").strip() or "2099-12-31"
+        dsel = [d for d in f.getlist("doors") if d in ("1", "2", "3", "4")]
+        existed = str(num) in (pdb.controller_acl(s, CONF) or {})
+        if dsel:
+            pdb.cli(CONF, "put-card", s, num, frm, to, ",".join(dsel), timeout=12)
+        else:                                            # no doors on this controller = not in its ACL
+            pdb.cli(CONF, "delete-card", s, num, timeout=12)
+        pdb.save_card_record(s, num, frm, to, dsel, f.get("name", "").strip()); reload_httpd()
+        audit("edit card" if existed else "add card", f"{s} {num}")
+        return redirect(url_for("cards", serial=s))
+    cur = pdb.controller_acl(serial, CONF) if serial else None
+    cnames = pdb.card_names()
+    ed = request.args.get("edit", "")
+    edinfo = (cur or {}).get(ed)
+    if serial and cur is None:
+        rows = "<tr><td colspan=6 class=r>controller offline — can't read its cards right now</td></tr>"
+    else:
+        rows = ""
+        for num, info in sorted((cur or {}).items()):
+            dd = ", ".join(door_name(x, serial) for x in sorted(info["doors"])) or "<span class=muted>none</span>"
+            rows += (f"<tr><td>{h(cnames.get(num, ''))}</td><td>{h(num)}</td><td>{h(info['from'])}</td><td>{h(info['to'])}</td>"
+                     f"<td>{dd}</td><td style=white-space:nowrap><a class=editlink href='?serial={escape(serial)}&edit={escape(num)}'>edit</a>"
+                     f"<form method=post style=display:inline><input type=hidden name=serial value='{escape(serial)}'>"
+                     f"<input type=hidden name=card value='{escape(num)}'><input type=hidden name=action value=delete>"
+                     f"<button class=del>delete</button></form></td></tr>")
+        rows = rows or "<tr><td colspan=6 class=muted>no cards on this controller</td></tr>"
+    tabs = ""
+    if len(cfg) > 1:
+        tabs = "<p>" + " ".join(f"<a href='?serial={escape(s)}' class='editlink'>{h(names.get(s, s))}</a>" for s in cfg) + "</p>"
+    dchecks = "".join(f"<label style='display:inline-block;margin-right:12px'><input type=checkbox name=doors value={n}"
+                      f"{' checked' if edinfo and n in edinfo['doors'] else ''}> {door_name(n, serial)}</label>" for n in (1, 2, 3, 4))
+    en = h(cnames.get(ed, "")) if edinfo else ""
+    cancel = f" <a href='{url_for('cards', serial=serial)}' style='align-self:center;color:var(--muted)'>cancel</a>" if edinfo else ""
+    body = f"""<h1>Cards</h1>
+    <p class=muted>Cards are read from and written straight to the controller (immediate, offline-correct). The holder
+    name and door groups are saved to the Access UI store so both panels match.</p>{tabs}
+    <table><tr><th>Holder</th><th>Card #</th><th>From</th><th>To</th><th>Doors</th><th></th></tr>{rows}</table>
+    <div class=card><h2>{'Edit' if edinfo else 'Add'} card</h2><form class=row method=post>
+      <input type=hidden name=serial value='{escape(serial)}'>
+      <div><label>holder name</label><input name=name value="{en}"></div>
+      <div><label>card number</label><input name=card required value="{h(ed) if edinfo else ''}"{' readonly' if edinfo else ''}></div>
+      <div><label>from</label><input name=from size=11 placeholder=2000-01-01 value="{h(edinfo['from']) if edinfo else ''}"></div>
+      <div><label>to</label><input name=to size=11 placeholder=2099-12-31 value="{h(edinfo['to']) if edinfo else ''}"></div>
+      <div><label>doors</label><br>{dchecks}</div>
+      <button>{'Save' if edinfo else 'Add'}</button>{cancel}</form>
+      <p class=muted>Leaving dates blank uses 2000-01-01 … 2099-12-31. Doors not ticked are denied.</p></div>"""
+    return page("cards", "Cards", body)
+
+
+@app.route("/groups", methods=["GET", "POST"])
+def groups():
+    db()
+    doors = pdb.doors_all()
+    dname = {d["OID"]: (d.get("name") or "").strip() or d["OID"] for d in doors}
+    if request.method == "POST":
+        f = request.form
+        if f.get("del", "").strip():
+            pdb.delete_group(f["del"]); audit("delete group", f["del"]); reload_httpd()
+            return redirect(url_for("groups"))
+        name = f.get("name", "").strip()
+        if not name:
+            return bad("groups", "Group needs a name.")
+        sel = [d for d in f.getlist("doors") if d in dname]
+        pdb.save_group(f.get("oid") or None, name, sel)
+        audit("edit group" if f.get("oid") else "add group", name); reload_httpd()
+        return redirect(url_for("groups"))
+    ed = next((x for x in pdb.groups_all() if x.get("OID") == request.args.get("edit")), None)
+    rows = "".join(
+        f"<tr><td>{h(gp.get('name'))}</td><td>{h(', '.join(dname.get(o, o) for o in gp.get('doors', [])) or '—')}</td>"
+        f"<td style=white-space:nowrap><a class=editlink href='?edit={escape(gp['OID'])}'>edit</a>"
+        f"<form method=post style=display:inline><input type=hidden name=del value='{escape(gp['OID'])}'><button class=del>delete</button></form></td></tr>"
+        for gp in pdb.groups_all()) or "<tr><td colspan=3 class=muted>no groups</td></tr>"
+    checks = "".join(
+        f"<label style='display:inline-block;margin:0 12px 6px 0'><input type=checkbox name=doors value='{escape(d['OID'])}'"
+        f"{' checked' if ed and d['OID'] in (ed.get('doors') or []) else ''}> {h(dname[d['OID']])}</label>"
+        for d in doors) or "<span class=muted>no doors defined in the Access UI yet</span>"
+    oid = f"<input type=hidden name=oid value='{escape(ed['OID'])}'>" if ed else ""
+    cancel = f" <a href='{url_for('groups')}' style='color:var(--muted)'>cancel</a>" if ed else ""
+    body = f"""<h1>Groups</h1>
+    <p class=muted>A group grants its members a set of doors; a card's access = the union of its groups' doors.
+    Saved to the Access UI store and reloaded, so both panels match.</p>
+    <table><tr><th>Name</th><th>Doors</th><th></th></tr>{rows}</table>
+    <div class=card><h2>{'Edit' if ed else 'Add'} group</h2><form method=post>
+      <div style='margin-bottom:10px'><label>name</label><input name=name required value="{h(ed.get('name')) if ed else ''}">{oid}</div>
+      <div style='margin-bottom:10px'><label>doors</label><br>{checks}</div>
+      <button>{'Save' if ed else 'Add'}</button>{cancel}</form></div>"""
+    return page("groups", "Groups", body)
+
+
+@app.route("/users", methods=["GET", "POST"])
+def users():
+    c = db()
+    if request.method == "POST":
+        f = request.form
+        if f.get("kind") == "allow":
+            cur = {e.strip().lower() for e in setting_get(c, "ops_allow").split(",") if e.strip()}
+            if f.get("remove", "").strip():
+                cur.discard(f["remove"].strip().lower())
+            elif f.get("email", "").strip():
+                cur.add(f["email"].strip().lower())
+            if cur and g.who != "unknown":
+                cur.add(g.who)                           # never let an admin lock themselves out of Ops
+            setting_set(c, "ops_allow", ",".join(sorted(cur))); c.commit()
+            audit("edit ops access", ",".join(sorted(cur)) or "(any)")
+            return redirect(url_for("users"))
+        # login users (Access UI)
+        if f.get("del", "").strip():
+            pdb.delete_user(f["del"]); audit("delete login", f["del"]); reload_httpd()
+            return redirect(url_for("users"))
+        uid, role = f.get("uid", "").strip(), (f.get("role", "").strip() or "user")
+        if not uid:
+            return bad("users", "Login needs a username.")
+        if role not in ("admin", "user"):
+            role = "user"
+        if not f.get("oid") and not f.get("password"):
+            return bad("users", "A new login needs a password.")
+        pdb.save_user(f.get("oid") or None, uid, role, f.get("password") or None)
+        audit("edit login" if f.get("oid") else "add login", uid); reload_httpd()
+        return redirect(url_for("users"))
+    edu = next((u for u in pdb.users_all() if u.get("OID") == request.args.get("edit")), None)
+    lrows = "".join(
+        f"<tr><td>{h(u.get('uid'))}</td><td>{h(u.get('role'))}</td>"
+        f"<td style=white-space:nowrap><a class=editlink href='?edit={escape(u['OID'])}'>edit</a>"
+        f"<form method=post style=display:inline><input type=hidden name=del value='{escape(u['OID'])}'><button class=del>delete</button></form></td></tr>"
+        for u in pdb.users_all()) or "<tr><td colspan=3 class=muted>no logins</td></tr>"
+    allow = sorted({e.strip().lower() for e in setting_get(c, "ops_allow").split(",") if e.strip()})
+    arows = "".join(
+        f"<tr><td>{h(e)}</td><td><form method=post style=display:inline><input type=hidden name=kind value=allow>"
+        f"<input type=hidden name=remove value='{escape(e)}'><button class=del>remove</button></form></td></tr>"
+        for e in allow) or "<tr><td colspan=2 class=muted>anyone authenticated by Cloudflare Access (no allow-list)</td></tr>"
+    oid = f"<input type=hidden name=oid value='{escape(edu['OID'])}'>" if edu else ""
+    rsel = "".join(f"<option value={r}{' selected' if edu and edu.get('role') == r else ''}>{r}</option>" for r in ("user", "admin"))
+    cancel = f" <a href='{url_for('users')}' style='color:var(--muted)'>cancel</a>" if edu else ""
+    body = f"""<h1>Users</h1>
+    <div class=card><h2>Access UI logins</h2>
+      <p class=muted>Operator accounts for the main Access UI (users.json). Passwords are salted-SHA256, same as the UI.</p>
+      <table><tr><th>Username</th><th>Role</th><th></th></tr>{lrows}</table>
+      <form class=row method=post style='margin-top:10px'><input type=hidden name=kind value=login>{oid}
+        <div><label>username</label><input name=uid required value="{h(edu.get('uid')) if edu else ''}"></div>
+        <div><label>role</label><select name=role>{rsel}</select></div>
+        <div><label>password</label><input name=password type=password placeholder="{'(unchanged)' if edu else ''}"></div>
+        <button>{'Save' if edu else 'Add'}</button>{cancel}</form></div>
+    <div class=card><h2>Ops access list</h2>
+      <p class=muted>Emails allowed into this Ops panel (via Cloudflare Access). Empty = any authenticated user.</p>
+      <table><tr><th>Email</th><th></th></tr>{arows}</table>
+      <form class=row method=post style='margin-top:10px'><input type=hidden name=kind value=allow>
+        <div><label>add email</label><input name=email type=email placeholder="name@domain.com" required></div>
+        <button>Add</button></form></div>
+    <div class=card><h2>Cardholders</h2>
+      <p class=muted>Card holders and their access are managed on the <a href="{url_for('cards')}" style="color:var(--brass)">Cards</a> page.</p></div>"""
+    return page("users", "Users", body)
 
 
 @app.route("/logs", methods=["GET", "POST"])

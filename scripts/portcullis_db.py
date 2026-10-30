@@ -6,7 +6,7 @@ tables and the report logic live in exactly one place.
 
 Copyright (c) 2026 TomTom Enterprises.
 """
-import os, re, sqlite3, subprocess, datetime, json
+import os, re, sqlite3, subprocess, datetime, json, hashlib
 
 DB = os.environ.get("PORTCULLIS_DB", "/var/lib/portcullis/portcullis.db")
 
@@ -356,6 +356,125 @@ def adopt_from_controller(serial, conf=None, dry_run=True):
         _write_store("cards.json", {"cards": cards})
     return {"dry_run": dry_run, "door_changes": door_changes,
             "cards_add": adds, "cards_update": updates, "cards_remove": removes}
+
+
+def _utcnow():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ── Access UI store CRUD (caller reloads httpd after a write) ──────────────────────────────────────
+def groups_all():   return _httpd_json("groups.json").get("groups", [])
+def doors_all():    return _httpd_json("doors.json").get("doors", [])
+def users_all():    return _httpd_json("users.json").get("users", [])
+
+
+def save_group(oid, name, door_oids):
+    """Create (oid falsy) or update a group. Returns the OID."""
+    gs = groups_all()
+    g = next((x for x in gs if x.get("OID") == oid), None) if oid else None
+    if g:
+        g.update(name=name, doors=list(door_oids), modified=_utcnow())
+    else:
+        oid = _next_oid(gs, "0.5")
+        gs.append({"OID": oid, "name": name, "doors": list(door_oids), "created": _utcnow(), "modified": ""})
+    _write_store("groups.json", {"groups": gs})
+    return oid
+
+
+def delete_group(oid):
+    _write_store("groups.json", {"groups": [g for g in groups_all() if g.get("OID") != oid]})
+
+
+def _hash_pw(pwd):
+    """uhppoted-httpd scheme: salt = 16 random bytes; password = hex(sha256(salt || utf8(pwd)))."""
+    salt = os.urandom(16)
+    return salt.hex(), hashlib.sha256(salt + (pwd or "").encode("utf-8")).hexdigest()
+
+
+def save_user(oid, uid, role, password=None):
+    """Create or update an Access-UI login. Only sets the password when one is supplied."""
+    us = users_all()
+    u = next((x for x in us if x.get("OID") == oid), None) if oid else None
+    if u:
+        u.update(uid=uid, role=role, modified=_utcnow())
+        if password:
+            u["salt"], u["password"] = _hash_pw(password)
+    else:
+        salt, pw = _hash_pw(password or "")
+        us.append({"OID": _next_oid(us, "0.8"), "name": uid, "uid": uid, "role": role,
+                   "salt": salt, "password": pw, "otp": "", "created": _utcnow(), "modified": ""})
+    _write_store("users.json", {"users": us})
+
+
+def delete_user(oid):
+    _write_store("users.json", {"users": [u for u in users_all() if u.get("OID") != oid]})
+
+
+def ensure_door_oid(serial, pos, name=None):
+    """Return the door-record OID for (serial, position), creating + linking one if absent."""
+    ctrls = _httpd_json("controllers.json").get("controllers", [])
+    cc = next((c for c in ctrls if str(c.get("device-id")) == str(serial)), None)
+    if not cc:
+        return None
+    oid = (cc.get("doors") or {}).get(str(pos), "")
+    if oid:
+        return oid
+    ds = doors_all()
+    oid = _next_oid(ds, "0.3")
+    ds.append({"OID": oid, "name": name or f"Door {pos}", "delay": 5, "mode": "controlled",
+               "created": _utcnow(), "modified": ""})
+    _write_store("doors.json", {"doors": ds})
+    cc.setdefault("doors", {})[str(pos)] = oid
+    cc["modified"] = _utcnow()
+    _write_store("controllers.json", {"controllers": ctrls})
+    return oid
+
+
+def save_door(oid, name, keypad):
+    """Update a door record's name + keypad flag (mode/delay go to the controller, not here)."""
+    ds = doors_all()
+    d = next((x for x in ds if x.get("OID") == oid), None)
+    if not d:
+        return False
+    d.update(name=name, keypad=bool(keypad), modified=_utcnow())
+    _write_store("doors.json", {"doors": ds})
+    return True
+
+
+def _group_for_door_oid(doid, door_name=""):
+    """OID of a single-door group for this door, creating one if none exists (re-reads each call)."""
+    gs = groups_all()
+    g = next((x for x in gs if x.get("doors") == [doid]), None)
+    if g:
+        return g["OID"]
+    oid = _next_oid(gs, "0.5")
+    gs.append({"OID": oid, "name": door_name or f"Door {doid}", "doors": [doid],
+               "created": _utcnow(), "modified": ""})
+    _write_store("groups.json", {"groups": gs})
+    return oid
+
+
+def save_card_record(serial, num, frm, to, positions, name):
+    """Upsert a card's name/validity/group-doors in cards.json so the Access UI matches what Ops just
+    wrote to the controller. positions = list of door numbers (1-4) granted on `serial`."""
+    pos_oid = {p: o for o, p in _door_oid_to_pos(serial).items()}
+    dn = {d["OID"]: (d.get("name") or "") for d in doors_all()}
+    gids = [_group_for_door_oid(pos_oid[int(p)], dn.get(pos_oid[int(p)], "")) for p in positions if int(p) in pos_oid]
+    cards = _httpd_json("cards.json").get("cards", [])
+    ex = next((c for c in cards if str(c.get("card")) == str(num)), None)
+    if ex:
+        ex.update(**{"from": frm}, to=to, groups=gids, modified=_utcnow())
+        if name:
+            ex["name"] = name
+    else:
+        cards.append({"OID": _next_oid(cards, "0.4"), "name": name or f"Card {num}", "card": int(num),
+                      "from": frm, "to": to, "groups": gids, "created": _utcnow(), "modified": ""})
+    _write_store("cards.json", {"cards": cards})
+
+
+def delete_card_record(num):
+    cards = [c for c in _httpd_json("cards.json").get("cards", []) if str(c.get("card")) != str(num)]
+    _write_store("cards.json", {"cards": cards})
 
 
 def discover_onvif(timeout=3):
