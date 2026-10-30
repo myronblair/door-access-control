@@ -23,7 +23,7 @@ VAR_DIR="/var/uhppoted"
 LOG_DIR="/var/log/uhppoted"
 BIN_DIR="/usr/local/bin"
 GO_ROOT="/usr/local/go"
-SERVICES="uhppoted-httpd uhppoted-rest uhppoted-mqtt portcullis-doorctl"
+SERVICES="uhppoted-httpd uhppoted-rest uhppoted-mqtt portcullis-doorctl portcullis-collector"
 BINARIES="uhppote-cli uhppoted-rest uhppoted-httpd uhppoted-mqtt"
 PORTCULLIS_DIR="/opt/portcullis"
 PORTCULLIS_ETC="/etc/portcullis"
@@ -67,7 +67,7 @@ fi
 # ─── optional: config, data, user ────────────────────────────────────────────
 if [ "$PURGE" = "1" ]; then
   log "PURGE: removing config, data, logs, shim token/log and service user..."
-  rm -rf "$ETC_DIR" "$VAR_DIR" "$LOG_DIR" "$PORTCULLIS_ETC" "$PORTCULLIS_LOG"
+  rm -rf "$ETC_DIR" "$VAR_DIR" "$LOG_DIR" "$PORTCULLIS_ETC" "$PORTCULLIS_LOG" /var/lib/portcullis
   if id "$UHPPOTED_USER" >/dev/null 2>&1; then userdel "$UHPPOTED_USER" 2>/dev/null || true; fi
   printf '\e[32m[done]\e[0m fully removed (including config + cardholder/web database).\n'
 else

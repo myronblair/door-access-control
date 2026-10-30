@@ -50,6 +50,17 @@ A USB 125 kHz reader (e.g. UHPPOTE B014SACF9Q) also works for desk enrollment, b
 3. `scripts/doorctl.py` + `scripts/portcullis-doorctl.service` — the shim (create `/etc/portcullis/doorctl.token` with `openssl rand -hex 24`, chmod 600, `uhppoted`-owned; ufw-allow 8082 from .211/.97).
 4. Cloudflare Tunnel: `cloudflared service install <token>`; add Public Hostname + Access app in the dashboard.
 
+## Phase B — reporting modules
+Built on a shared **event pipeline**: `portcullis-collector` polls the controller's event buffer into
+SQLite (`/var/lib/portcullis/portcullis.db`, table `events`) every 30s — durable, backfills history,
+survives the controller flapping.
+- **Event pipeline** — DONE (`scripts/collector.py`, service `portcullis-collector`; 18 historical events captured).
+- **Attendance** — DONE (core): `scripts/report.py` → per-card, per-day first-seen/last-seen/counts.
+  `sudo -u uhppoted python3 /opt/portcullis/report.py [--days N] [--json]`.
+- **Patrol / Meeting-sign** — TODO: need your definitions (which readers are patrol checkpoints + routes/schedules; meeting list). Both are queries over the same `events` table.
+- **Hikvision cameras** — TODO: via ISAPI/RTSP on Linux (needs camera IPs + creds); link a camera to a door, snapshot on event.
+- **Web views** — TODO: attendance/patrol are CLI/JSON today; surfacing them in the gated web UI needs a small page served behind the Cloudflare tunnel.
+
 ## Pending / decisions
 - **Door names** — confirm which physical door is 1/2/3/4 (improves HA/JARVIS phrasing). Only 1+2 are in use.
 - **HA activation** — paste `integrations/home-assistant.yaml` (HA has no non-interactive SSH from here).

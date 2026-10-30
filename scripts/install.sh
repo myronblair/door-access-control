@@ -279,6 +279,39 @@ EOF
   systemctl daemon-reload
 fi
 
+# ─── 8b. event collector + attendance (Phase B foundation) ───────────────────
+if [ -f "$HERE/collector.py" ]; then
+  log "installing portcullis-collector (access events -> SQLite)..."
+  install -m755 "$HERE/collector.py" "$PORTCULLIS_DIR/collector.py"
+  [ -f "$HERE/report.py" ] && install -m755 "$HERE/report.py" "$PORTCULLIS_DIR/report.py"
+  install -d -o "$UHPPOTED_USER" -g "$UHPPOTED_USER" /var/lib/portcullis
+  chown "$UHPPOTED_USER:$UHPPOTED_USER" "$PORTCULLIS_DIR"/collector.py "$PORTCULLIS_DIR"/report.py 2>/dev/null || true
+  cat > /etc/systemd/system/portcullis-collector.service <<EOF
+[Unit]
+Description=Portcullis event collector (access events -> SQLite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$UHPPOTED_USER
+Group=$UHPPOTED_USER
+Environment=PORTCULLIS_SERIAL=$SERIAL
+ExecStart=/usr/bin/python3 $PORTCULLIS_DIR/collector.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/portcullis
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+fi
+
 # ─── 9. firewall — lock REST + door shim to the integration hosts only ────────
 if command -v ufw >/dev/null 2>&1; then
   log "configuring firewall (ufw): SSH + controller events open; REST/$REST_PORT + shim/$SHIM_PORT limited to integrations..."
@@ -297,6 +330,7 @@ fi
 svcs="uhppoted-httpd uhppoted-rest"
 [ -n "$MQTT_BROKER" ] && svcs="$svcs uhppoted-mqtt"
 [ -f "$HERE/doorctl.py" ] && svcs="$svcs portcullis-doorctl"
+[ -f "$HERE/collector.py" ] && svcs="$svcs portcullis-collector"
 if [ "$START" = "1" ]; then
   log "enabling + starting services..."
   for s in $svcs; do systemctl enable --now "$s" >/dev/null 2>&1 || warn "$s failed to start (check: journalctl -u $s)"; done
