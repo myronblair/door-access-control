@@ -103,6 +103,7 @@ def poll(con):
     have = con.execute("SELECT MAX(idx) FROM events").fetchone()[0] or 0
     start = max(have + 1, first)
     n = 0
+    fresh = []
     now = datetime.datetime.now().isoformat(timespec="seconds")
     for i in range(start, last + 1):
         rc, out = cli("get-event", SERIAL, str(i))
@@ -112,11 +113,13 @@ def poll(con):
         if row:
             con.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?,?)", (*row, now))
             n += 1
-            try:
-                maybe_snapshot(con, row[0], row[3], row[1])   # idx, door, ts
-            except Exception:
-                pass
-    con.commit()
+            fresh.append((row[0], row[3], row[1]))   # idx, door, ts
+    con.commit()                                   # durability first — don't hold events hostage to camera latency
+    for idx, door, ts in fresh:                    # snapshots are best-effort, after commit
+        try:
+            maybe_snapshot(con, idx, door, ts)
+        except Exception:
+            pass
     return n
 
 

@@ -15,9 +15,14 @@ DB  = os.environ.get("PORTCULLIS_DB", "/var/lib/portcullis/portcullis.db")
 app = Flask(__name__)
 
 
-def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
+_schema_ready = False
+
+
+class _Conn(sqlite3.Connection):
+    """Connection subclass so the per-request door-name map can be cached on the handle."""
+
+
+def _ensure_schema(c):
     c.executescript("""
     CREATE TABLE IF NOT EXISTS events(idx INTEGER PRIMARY KEY, ts TEXT, card TEXT, door INTEGER,
         granted INTEGER, event_type INTEGER, raw TEXT, collected_at TEXT);
@@ -34,16 +39,22 @@ def db():
     cols = [r[1] for r in c.execute("PRAGMA table_info(cameras)")]
     if "password" not in cols: c.execute("ALTER TABLE cameras ADD COLUMN password TEXT")
     if "channel"  not in cols: c.execute("ALTER TABLE cameras ADD COLUMN channel TEXT DEFAULT '101'")
+
+
+def db():
+    global _schema_ready
+    c = sqlite3.connect(DB, factory=_Conn)
+    c.row_factory = sqlite3.Row
+    if not _schema_ready:                       # schema is created once, not on every request
+        _ensure_schema(c)
+        _schema_ready = True
+    s = {r[0]: r[1] for r in c.execute("SELECT k, v FROM settings")}   # door names loaded once/request
+    c.door_map = {n: (s.get(f"door{n}") or f"Door {n}") for n in (1, 2, 3, 4)}
     return c
 
 
-def setting(c, k, default=""):
-    r = c.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
-    return r["v"] if r else default
-
-
 def door_name(c, n):
-    return setting(c, f"door{n}", f"Door {n}") or f"Door {n}"
+    return c.door_map.get(int(n), f"Door {n}")
 
 
 BASE = """<!doctype html><html lang=en><head><meta charset=utf-8>
