@@ -53,6 +53,7 @@ def db():
     if "db" not in g:
         g.db = pdb.connect(pdb.sqlite3.Row)
         g.door_map = pdb.door_names()
+        g.door_maps = {}                          # serial -> per-controller door names (lazy)
         g.card_map = pdb.card_names()
     return g.db
 
@@ -64,11 +65,16 @@ def close_db(_exc):
         c.close()
 
 
-def door_name(n):
+def door_name(n, serial=None):
     try:
         n = int(n)
     except (TypeError, ValueError):
         return f"Door {h(n)}"
+    if serial:                                    # per-controller names (cached per request)
+        m = g.door_maps.get(serial)
+        if m is None:
+            m = g.door_maps[serial] = pdb.door_names(serial)
+        return h(m.get(n, f"Door {n}"))
     return h(g.door_map.get(n, f"Door {n}"))
 
 
@@ -205,14 +211,20 @@ def events():
     since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     evs = c.execute("""SELECT e.*, s.idx AS snap FROM events e LEFT JOIN snapshots s ON s.idx=e.idx
                        WHERE e.ts>=? ORDER BY e.idx DESC LIMIT 500""", (since,)).fetchall()
+    multi = len(known_controllers()) > 1          # only show the controller column when it matters
+    cnames = known_controllers()
     cam = lambda e: (f"<a href='{url_for('snapshot', idx=e['idx'])}' target=_blank title='camera snapshot'>&#128247;</a>" if e['snap'] else "")
-    rows = "".join(f"<tr><td>{e['idx']}</td><td>{h(e['ts'])}</td><td>{card_label(e['card'])}</td><td>{door_name(e['door'])}</td>"
+    cctl = lambda e: f"<td>{h(cnames.get(e['controller'], e['controller'] or '—'))}</td>" if multi else ""
+    rows = "".join(f"<tr><td>{e['idx']}</td><td>{h(e['ts'])}</td>{cctl(e)}<td>{card_label(e['card'])}</td>"
+                   f"<td>{door_name(e['door'], e['controller'])}</td>"
                    f"<td class='{'g' if e['granted'] else 'r'}'>{'granted' if e['granted'] else 'denied'}</td>"
-                   f"<td>{h(e['event_type'])}</td><td>{cam(e)}</td></tr>" for e in evs) or "<tr><td colspan=7 class=muted>none</td></tr>"
+                   f"<td>{h(e['event_type'])}</td><td>{cam(e)}</td></tr>" for e in evs) \
+           or f"<tr><td colspan={8 if multi else 7} class=muted>none</td></tr>"
+    cth = "<th>Controller</th>" if multi else ""
     body = f"""<h1>Events</h1>
     <form class=row method=get><div><label>show last (days)</label><input name=days value="{days}" size=5></div><button>Filter</button></form>
     <p class=muted>{len(evs)} events (most recent 500)</p>
-    <table><tr><th>#</th><th>Time</th><th>Card</th><th>Door</th><th>Result</th><th>Type</th><th>Cam</th></tr>{rows}</table>"""
+    <table><tr><th>#</th><th>Time</th>{cth}<th>Card</th><th>Door</th><th>Result</th><th>Type</th><th>Cam</th></tr>{rows}</table>"""
     return page("events", "Events", body)
 
 

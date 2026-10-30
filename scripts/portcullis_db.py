@@ -16,7 +16,7 @@ HTTPD_SYS = os.environ.get("PORTCULLIS_HTTPD_SYS", "/var/uhppoted/httpd/system")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(idx INTEGER PRIMARY KEY, ts TEXT, card TEXT, door INTEGER,
-    granted INTEGER, event_type INTEGER, raw TEXT, collected_at TEXT);
+    granted INTEGER, event_type INTEGER, raw TEXT, collected_at TEXT, controller TEXT);
 CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_events_card ON events(card);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -54,6 +54,8 @@ def connect(row_factory=None):
         cols = [r[1] for r in con.execute("PRAGMA table_info(cameras)")]
         if "password" not in cols: con.execute("ALTER TABLE cameras ADD COLUMN password TEXT")
         if "channel"  not in cols: con.execute("ALTER TABLE cameras ADD COLUMN channel TEXT DEFAULT '101'")
+        if "controller" not in [r[1] for r in con.execute("PRAGMA table_info(events)")]:
+            con.execute("ALTER TABLE events ADD COLUMN controller TEXT")
         con.commit()
         try:
             os.chmod(DB, 0o600)

@@ -22,9 +22,10 @@ from concurrent.futures import ThreadPoolExecutor
 import portcullis_db as pdb
 
 CONF   = os.environ.get("PORTCULLIS_CONF", "/etc/uhppoted/uhppoted.conf")
-SERIAL = os.environ.get("PORTCULLIS_SERIAL", "223208728")
+SERIAL = os.environ.get("PORTCULLIS_SERIAL", "223208728")  # fallback when the config can't be read
 CLI    = "/usr/local/bin/uhppote-cli"
 POLL   = int(os.environ.get("PORTCULLIS_POLL", "10"))
+STRIDE = 1_000_000_000   # per-controller index namespace, so two controllers' events never collide
 SNAP_DIR       = os.environ.get("PORTCULLIS_SNAPSHOTS", "/var/lib/portcullis/snapshots")
 SNAP_MAX_AGE   = 180   # only snapshot fresh events (never the historical backfill)
 SNAP_KEEP_DAYS = int(os.environ.get("PORTCULLIS_SNAP_KEEP_DAYS", "30"))
@@ -40,6 +41,11 @@ def cli(*a, t=15):
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
+def serials():
+    """Every controller serial in the config (falls back to the primary env serial)."""
+    return list(pdb.configured_controllers(CONF).keys()) or [SERIAL]
+
+
 def meta_get(con, k, default=None):
     r = con.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
     return r[0] if r else default
@@ -50,9 +56,9 @@ def meta_set(con, k, v):
     con.commit()
 
 
-def bounds():
-    """Return (first, last) event indices on the controller, or None if unreachable."""
-    rc, out = cli("get-events", SERIAL)          # e.g. "223208728 1 18 0"
+def bounds(serial):
+    """Return (first, last) event indices on a controller, or None if unreachable."""
+    rc, out = cli("get-events", serial)          # e.g. "223208728 1 18 0"
     if rc != 0:
         return None
     p = out.split()
@@ -60,6 +66,22 @@ def bounds():
         return int(p[1]), int(p[2])
     except (IndexError, ValueError):
         return None
+
+
+def ctrl_pos(con, serial):
+    """The start of a controller's STRIDE-wide index namespace. The first controller ever seen gets 0
+    (so existing rows are untouched); each new one gets the next STRIDE block."""
+    order = [x for x in (meta_get(con, "ctrl_order", "") or "").split(",") if x]
+    if serial not in order:
+        order.append(serial)
+        meta_set(con, "ctrl_order", ",".join(order))
+    return order.index(serial) * STRIDE
+
+
+def ctrl_base(con, serial):
+    """A controller's index offset: its namespace start plus a per-controller `off_<serial>` that is
+    bumped when the controller's counter resets, so new events keep landing above the old ones."""
+    return ctrl_pos(con, serial) + int(meta_get(con, f"off_{serial}", "0"))
 
 
 def parse(out):
@@ -74,23 +96,24 @@ def parse(out):
         return None
 
 
-_skew = {"val": 0.0, "ts": 0.0}
+_skew = {}   # serial -> {"val": seconds-ahead, "ts": last-read}
 
 
-def controller_skew():
-    """Seconds the controller's clock is ahead of this host (0 if it can't be read). Cached for
-    5 min — the offset drifts slowly and each read is a controller round-trip."""
-    if time.time() - _skew["ts"] < 300:
-        return _skew["val"]
+def controller_skew(serial):
+    """Seconds a controller's clock is ahead of this host (0 if it can't be read). Cached per
+    controller for 5 min — the offset drifts slowly and each read is a controller round-trip."""
+    s = _skew.setdefault(serial, {"val": 0.0, "ts": 0.0})
+    if time.time() - s["ts"] < 300:
+        return s["val"]
     try:
-        rc, out = cli("get-time", SERIAL, t=8)
+        rc, out = cli("get-time", serial, t=8)
         m = re.search(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})", out)
         if rc == 0 and m:
             ctrl = datetime.datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
-            _skew.update(val=(ctrl - datetime.datetime.now()).total_seconds(), ts=time.time())
+            s.update(val=(ctrl - datetime.datetime.now()).total_seconds(), ts=time.time())
     except Exception:
         pass
-    return _skew["val"]
+    return s["val"]
 
 
 def camera_map(con):
@@ -102,14 +125,14 @@ def camera_map(con):
     return cams
 
 
-def snapshot_fresh(con, fresh):
+def snapshot_fresh(con, fresh, serial):
     """Best-effort ISAPI snapshots for fresh events on doors that have a camera. The captures run
     concurrently (network I/O only); all database writes stay on this thread."""
     cams = camera_map(con)
     cand = [f for f in fresh if f[1] in cams]
     if not cand:
         return
-    skew, now = controller_skew(), datetime.datetime.now()
+    skew, now = controller_skew(serial), datetime.datetime.now()
 
     def age(ts):
         try:
@@ -150,44 +173,53 @@ def prune(con):
     return len(old)
 
 
-def poll(con):
-    b = bounds()
+def poll_one(con, serial):
+    b = bounds(serial)
     if not b:
         return 0
     first, last = b
-    base = int(meta_get(con, "idx_base", "0"))
-    top  = con.execute("SELECT MAX(idx) FROM events").fetchone()[0] or 0
-    have = top - base                              # highest controller index already stored
+    pos  = ctrl_pos(con, serial)
+    base = pos + int(meta_get(con, f"off_{serial}", "0"))
+    top  = con.execute("SELECT MAX(idx) FROM events WHERE controller=?", (serial,)).fetchone()[0] or base
+    have = top - base                              # highest native controller index already stored
     if last < have:                                # controller counter went backwards (reset/replaced)
-        log(f"controller event counter went backwards ({last} < {have}); rebasing stored indices")
-        base = top
-        meta_set(con, "idx_base", base)
-        have = 0
+        log(f"{serial} event counter went backwards ({last} < {have}); rebasing its indices")
+        meta_set(con, f"off_{serial}", top - pos)  # new base == top, so fresh events land above the old
+        base, have = top, 0
     start = max(have + 1, first)
     n = 0
     fresh = []
     now = datetime.datetime.now().isoformat(timespec="seconds")
     for i in range(start, last + 1):
-        rc, out = cli("get-event", SERIAL, str(i))
+        rc, out = cli("get-event", serial, str(i))
         if rc != 0:
             break                                 # controller dropped mid-poll; resume next cycle
         row = parse(out)
         if row:
-            row = (row[0] + base, *row[1:])
-            con.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?,?)", (*row, now))
+            idx = row[0] + base
+            con.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?,?,?)",
+                        (idx, *row[1:], now, serial))
             n += 1
-            fresh.append((row[0], row[3], row[1]))   # idx, door, ts
+            fresh.append((idx, row[3], row[1]))   # idx, door, ts
     con.commit()                                   # durability first — don't hold events hostage to camera latency
     if fresh:
         try:
-            snapshot_fresh(con, fresh)             # best-effort, after commit
+            snapshot_fresh(con, fresh, serial)     # best-effort, after commit
         except Exception:
             log("snapshot error:\n" + traceback.format_exc())
     return n
 
 
+def poll(con):
+    """Poll every configured controller once."""
+    return sum(poll_one(con, s) for s in serials())
+
+
 if __name__ == "__main__":
     con = pdb.connect()
+    prim = serials()[0]                            # tag pre-existing (untagged) events to the primary controller
+    con.execute("UPDATE events SET controller=? WHERE controller IS NULL", (prim,))
+    con.commit()
     last_prune = 0.0
     while True:
         try:
