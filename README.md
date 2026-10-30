@@ -35,18 +35,25 @@ and they update everywhere in Ops automatically.
 | Page | What it does |
 |------|--------------|
 | **Dashboard** | Totals (events, distinct cards, last event) and the 10 most recent events. |
-| **Events** | Access-event history (most recent 500, filterable by days), card-holder name + number, resolved door name, result, event type, and a 📷 link to the snapshot captured at that event. Shows a Controller column once more than one controller is configured. |
+| **Events** | Access-event history (most recent 500, filterable by days), card-holder name + number, resolved door name, result, event type, and a 📷 link to the snapshot captured at that event. Shows a Controller column once more than one controller is configured. **Clear all** wipes the stored history + snapshots (sets a per-controller floor so cleared events aren't re-collected; never touches the panel). |
 | **Attendance** | Per-card, per-day first/last seen and granted counts over a chosen window. |
-| **Patrol** | Guard-tour checkpoints (a reader/door) and routes with a time window; shows live which checkpoints were hit on the current run (overnight windows supported). |
-| **Meetings** | Meeting definitions (reader + window); attendance = distinct cards granted at that reader in the window. |
-| **Cameras** | Hikvision/ISAPI cameras linked to a door (IP, user, password, channel); a camera on a door gets an auto-snapshot when that door fires an event. Includes a one-click credential **test**. |
-| **Devices** | One inventory of every peripheral tied to your controllers — cameras, keypads (read live from the Access UI door flags), and manually-added locks, closers, readers and sensors. Includes **ONVIF network discovery** for cameras and an **Add item** form for the wired peripherals that aren't network-discoverable. |
+| **Patrol** | Guard-tour checkpoints (a reader/door) and routes with a time window (add / edit / delete); shows live which checkpoints were hit on the current run (overnight windows supported). |
+| **Meetings** | Meeting definitions (reader + window; add / edit / delete); attendance = distinct cards granted at that reader in the window. |
+| **Cameras** | Hikvision/ISAPI cameras linked to a door (add / edit / delete; IP, user, password, channel); a camera on a door gets an auto-snapshot when that door fires an event. Includes a one-click credential **test**. |
+| **Devices** | One inventory of every peripheral tied to your controllers — cameras, keypads (read live from the Access UI door flags), and manually-added locks, closers, readers and sensors (add / edit / delete). Includes **ONVIF network discovery** for cameras. |
+| **Doors** | Each controller's four doors. Name + keypad flag are saved to the Access UI store; mode (controlled / normally-open / normally-closed) + unlock delay are **written straight to the panel**. |
+| **Cards** | Cardholders. Read from and written **straight to the controller** (immediate, offline-correct); card number, validity dates and per-door access. The holder name + door groups are mirrored into the Access UI store so both panels match. Per-controller tabs. |
+| **Groups** | Access groups (name + member doors) in the Access UI store; a card's access is the union of its groups' doors. |
+| **Users** | Access-UI operator logins (add / edit / delete, with the real salted-SHA256 password hash); the **Ops access list** (which Cloudflare-authenticated emails may use Ops, with a self-lockout guard); and a pointer to Cards for cardholders. |
 | **Controllers** | Every known controller with its real name and door assignments (from the Access UI store), flagging whether it's registered with the daemons and/or the Access UI. **Network discovery** (UHPPOTE broadcast) to find and add controllers. |
-| **Settings** | Read-only mirror of the door names (edited in the Access UI) and the listener-guard status. |
+| **Sync** | Live **synced / NOT-synced** status per controller (date/time, door config, card ACL) vs. the Access UI DB, with a header badge that turns red when anything drifts. Push buttons — **Set time**, **Sync doors**, **Sync ACL** — write the DB config to the panel; a confirm-gated reverse **Adopt panel → DB** overwrites the DB from the live panel when the panel is the source of truth. |
+| **Logs** | The **Ops action log** (every add / edit / delete / sync / door-open), the **Access UI audit log**, and the **guard service log** — each with a clear button. |
+| **Settings** | Read-only mirror of the door names (edited on the Doors page or the Access UI) and the listener-guard status. |
 
 Access to `/ops` is gated by the same Cloudflare Access identity as the rest of the site; every request
-must carry the `Cf-Access-Authenticated-User-Email` header (optionally restricted to an allow-list), and
-cross-origin form posts are rejected.
+must carry the `Cf-Access-Authenticated-User-Email` header (optionally restricted to the allow-list on the
+Users page), and cross-origin form posts are rejected. Writes to Access-UI-owned data (doors, cards,
+groups, logins) go through the uhppoted-httpd store and reload it so both panels stay consistent.
 
 ## Integrations
 - **JARVIS** voice — "open door &lt;n&gt;" calls the door shim (admin-gated) over the LAN.
