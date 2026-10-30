@@ -356,6 +356,7 @@ server {
   server_name _;
   location = /ops { return 302 /ops/; }
   location /ops/ { proxy_pass http://127.0.0.1:8083; proxy_set_header Host \$host; proxy_set_header X-Forwarded-For \$remote_addr; }
+  location ~* \.css\$ { proxy_pass http://127.0.0.1:8088; proxy_set_header Host \$host; add_header Cache-Control "no-cache, must-revalidate" always; }
   location / { proxy_pass http://127.0.0.1:8088; proxy_set_header Host \$host; proxy_set_header X-Forwarded-For \$remote_addr; }
 }
 NG
