@@ -11,27 +11,27 @@ software *iCCard / "Contactless Cards Management System [Access Control & Attend
   MAC `00:57:0D:4D:E5:18`.
 
 ## Solution
-Web-driven service on a dedicated Ubuntu VM, built on uhppoted:
+Web-driven service on a dedicated Ubuntu VM:
 
 | Component | Role |
 |-----------|------|
-| `uhppoted-httpd` | Browser admin UI — cardholders, doors, groups, access rights, live events |
-| `uhppoted-rest` | REST API (drives JARVIS voice "open door") |
-| `uhppoted-mqtt` | Publishes door state/events to Home Assistant's MQTT broker |
-| `uhppote-cli` | Scripting + the card migration load |
+| Web UI service | Browser admin UI — cardholders, doors, groups, access rights, live events |
+| REST service | REST API (drives JARVIS voice "open door") |
+| MQTT service | Publishes door state/events to Home Assistant's MQTT broker |
+| Command-line tool | Scripting + the card migration load |
 | `portcullis-doorctl` | Token-auth door-unlock shim **+ listener guard** (keeps the controller reporting to this host; see below) |
 
 Integrations: Blair HQ dashboard tile, Home Assistant (4 door entities), JARVIS voice control.
 
 ## Deployment
 - **VM:** `portcullis` (Ubuntu) on the Proxmox cluster.
-- **Public URL:** `https://portcullis.tomtomenterprises.com` — Cloudflare-proxied, reverse-proxied by NPM to the VM's `uhppoted-httpd`.
+- **Public URL:** `https://portcullis.tomtomenterprises.com` — Cloudflare-proxied, reverse-proxied by NPM to the VM's web UI service.
 - **Gated access (internet-facing):** Cloudflare Access (Zero Trust — email/SSO) in front, **plus** the app's own login = defense in depth. Direct controller comms stay LAN-only.
 
 ## Repo layout
 ```
 reference/    Vendor docs + wiring diagrams + the old DB schema (SQL, no data)
-config/       uhppoted.conf and service units
+config/       controller configuration and service units
 scripts/      migration + helper scripts
 docs/         runbook / notes
 ```

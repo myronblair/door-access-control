@@ -5,8 +5,8 @@ Door access control for the 4-door UHPPOTE panel, replacing the dead iCCard v6.9
 ## Components
 - **VM `portcullis`** — VMID 119 on PVE1, **10.48.200.67**, Ubuntu 24.04 (2 vCPU / 2 GB / 20 GB). SSH key: `/root/.ssh/portcullis` on PVE1 (`ssh -i … portcullis@10.48.200.67`).
 - **Controller** — serial **223208728**, 10.48.200.61:60000, firmware v6.62. UHPPOTE protocol (UDP 60000).
-- **uhppoted stack** (built from source, systemd):
-  - `uhppoted-httpd` — web UI, HTTP **:8080** (localhost; TLS is on Cloudflare).
+- **Access stack** (built from source, systemd):
+  - web UI service (`uhppoted-httpd`) — web UI, HTTP **:8080** (localhost; TLS is on Cloudflare).
   - `uhppoted-rest` — REST API **:8081** (reads/writes; firewalled to JARVIS + HA).
   - `uhppote-cli` — CLI (`uhppote-cli --config /etc/uhppoted/uhppoted.conf …`).
 - **`portcullis-doorctl`** — custom token-auth shim, **:8082** (firewalled to JARVIS + HA). `POST /open/<1-4>` with `Authorization: Bearer <token>` → cardless unlock. Token at `/etc/portcullis/doorctl.token`.
@@ -45,7 +45,7 @@ A USB 125 kHz reader (e.g. UHPPOTE B014SACF9Q) also works for desk enrollment, b
 - Card numbers / the shim token / the old mdb / the pcap are **Gitea-only / on-host**, never GitHub.
 
 ## Reproduce / rebuild
-1. `scripts/install.sh` — uhppoted stack + config + hardened systemd units (validated on this VM).
+1. `scripts/install.sh` — access stack + config + hardened systemd units (validated on this VM).
 2. `branding/apply-branding.sh` — Portcullis logo + theme + naming.
 3. `scripts/doorctl.py` + `scripts/portcullis-doorctl.service` — the shim (create `/etc/portcullis/doorctl.token` with `openssl rand -hex 24`, chmod 600, `uhppoted`-owned; ufw-allow 8082 from .211/.97).
 4. Cloudflare Tunnel: `cloudflared service install <token>`; add Public Hostname + Access app in the dashboard.
@@ -55,7 +55,7 @@ Built on a shared **event pipeline**: `portcullis-collector` polls the controlle
 SQLite (`/var/lib/portcullis/portcullis.db`, table `events`) every 30s — durable, backfills history,
 survives the controller flapping.
 - **Ops web app** (`scripts/ops.py`, service `portcullis-ops`, Flask) — the Phase-B UI, **built into the
-  same gated URL at `/ops`**. nginx fronts :8080 (what the tunnel hits): `/` → the uhppoted access UI
+  same gated URL at `/ops`**. nginx fronts :8080 (what the tunnel hits): `/` → the access web UI
   (moved to :8088 internally), `/ops` → this app. Same Cloudflare Access gate, one login.
   **Pages:** Dashboard · Events · Attendance · Patrol · Meetings · Cameras · **Settings** — each module is
   configured in the UI (no code): patrol checkpoints + routes, meetings, cameras, door names.
@@ -75,7 +75,7 @@ survives the controller flapping.
 - **Hikvision cameras** — fully UI-configurable (IP / user / **password** / channel / door) with a **test**
   button. The collector auto-grabs an ISAPI snapshot (`curl --digest`, `/ISAPI/Streaming/channels/<ch>/picture`)
   on fresh events for a door with a linked camera; it shows on the Events page (📷). All config in the UI — no host steps.
-- **Discoverability** — an **OPS** link is added to the uhppoted nav, so `/ops` is reachable from the main UI.
+- **Discoverability** — an **OPS** link is added to the web UI nav, so `/ops` is reachable from the main UI.
 
 ## Pending / decisions
 - **Door names** — confirm which physical door is 1/2/3/4 (improves HA/JARVIS phrasing). Only 1+2 are in use.
