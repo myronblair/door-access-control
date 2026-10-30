@@ -325,13 +325,22 @@ if [ -f "$HERE/ops.py" ]; then
   "$PORTCULLIS_DIR/venv/bin/python" -c 'import flask' 2>/dev/null \
     || warn "Flask is not importable in $PORTCULLIS_DIR/venv — portcullis-ops will not start (try: $PORTCULLIS_DIR/venv/bin/pip install flask)"
   install -m755 "$HERE/ops.py" "$PORTCULLIS_DIR/ops.py"
-  # privileged helper for the Controllers "Discover + Add" flow: root-owned, restricted sudo
+  # privileged helpers: root-owned, invoked by Ops via tightly-restricted NOPASSWD sudo rules.
+  #   portcullis-add-controller  — Controllers "Discover + Add" (appends a controller to the config)
+  #   portcullis-reload-httpd    — restart uhppoted-httpd after Ops writes its JSON (adopt / door edits)
+  : > /tmp/pc-sudoers
   if [ -f "$HERE/add-controller.sh" ]; then
     install -m755 -o root -g root "$HERE/add-controller.sh" /usr/local/sbin/portcullis-add-controller
-    echo "$UHPPOTED_USER ALL=(root) NOPASSWD: /usr/local/sbin/portcullis-add-controller" > /tmp/pc-sudoers
-    visudo -cf /tmp/pc-sudoers && install -m440 -o root -g root /tmp/pc-sudoers /etc/sudoers.d/portcullis
-    rm -f /tmp/pc-sudoers
+    echo "$UHPPOTED_USER ALL=(root) NOPASSWD: /usr/local/sbin/portcullis-add-controller" >> /tmp/pc-sudoers
   fi
+  if [ -f "$HERE/reload-httpd.sh" ]; then
+    install -m755 -o root -g root "$HERE/reload-httpd.sh" /usr/local/sbin/portcullis-reload-httpd
+    echo "$UHPPOTED_USER ALL=(root) NOPASSWD: /usr/local/sbin/portcullis-reload-httpd" >> /tmp/pc-sudoers
+  fi
+  if [ -s /tmp/pc-sudoers ]; then
+    visudo -cf /tmp/pc-sudoers && install -m440 -o root -g root /tmp/pc-sudoers /etc/sudoers.d/portcullis
+  fi
+  rm -f /tmp/pc-sudoers
   install -m644 "$HERE/portcullis_db.py" "$PORTCULLIS_DIR/portcullis_db.py"
   install -d -m700 -o "$UHPPOTED_USER" -g "$UHPPOTED_USER" /var/lib/portcullis
   chown -R "$UHPPOTED_USER:$UHPPOTED_USER" "$PORTCULLIS_DIR"
@@ -353,9 +362,10 @@ Environment=PORTCULLIS_OPS_AUTH=access
 ExecStart=$PORTCULLIS_DIR/venv/bin/python $PORTCULLIS_DIR/ops.py
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=true
+# Ops uses sudo for two tightly-whitelisted root helpers (add-controller, reload-httpd), so it cannot
+# set NoNewPrivileges. It still runs unprivileged as $UHPPOTED_USER with the filesystem protections below.
 ProtectSystem=full
-ReadWritePaths=/var/lib/portcullis
+ReadWritePaths=/var/lib/portcullis /var/uhppoted/httpd/system
 ProtectHome=true
 PrivateTmp=true
 

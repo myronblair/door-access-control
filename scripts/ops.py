@@ -509,6 +509,15 @@ def sync():
                 doors = ",".join(str(x) for x in sorted(w["doors"])) or "1"
                 pdb.cli(CONF, "put-card", serial, card, frm, to, doors, timeout=12); n += 1
             audit("sync acl", f"{serial}: {n} card writes")
+        elif act == "adoptgo":
+            if f.get("confirm") != "yes":
+                return bad("sync", "Tick confirm — adopting overwrites the database to match the panel.")
+            res = pdb.adopt_from_controller(serial, CONF, dry_run=False)
+            if res.get("error"):
+                return bad("sync", "Adopt failed: " + res["error"])
+            subprocess.run(["sudo", "/usr/local/sbin/portcullis-reload-httpd"], timeout=40)
+            audit("adopt panel->DB", f"{serial}: +{len(res['cards_add'])} ~{len(res['cards_update'])} "
+                                     f"-{len(res['cards_remove'])} cards, {len(res['door_changes'])} door edits")
         return redirect(url_for("sync"))
 
     blocks, worst = "", "ok"
@@ -537,13 +546,33 @@ def sync():
               f"{extra}<button>{lbl}</button></form>")
         aclbtn = btn("syncacl", "Sync ACL &rarr; panel",
                      "<label style='display:inline;margin:0 6px 0 0'><input type=checkbox name=confirm value=yes> confirm</label>")
+        adopt_html = ""
+        if request.args.get("adopt") == serial:          # break-glass preview: panel -> DB
+            r = pdb.adopt_from_controller(serial, CONF, dry_run=True)
+            if r.get("error"):
+                adopt_html = f"<p class=err>{h(r['error'])}</p>"
+            else:
+                def lst(xs): return ", ".join(h(x) for x in xs[:40]) or "none"
+                adopt_html = (f"""<div style='margin-top:10px;border-top:1px solid var(--line);padding-top:10px'>
+                  <b style='color:var(--brass)'>Adopt preview — overwrite DB to match panel:</b>
+                  <p class=muted style='margin:6px 0'>cards to add: {lst(r['cards_add'])}<br>
+                  cards to update: {lst(r['cards_update'])}<br>
+                  cards to remove from DB: {lst(r['cards_remove'])}<br>
+                  door edits: {lst(r['door_changes'])}</p>
+                  <form method=post style=display:inline><input type=hidden name=serial value='{escape(serial)}'>
+                  <input type=hidden name=action value=adoptgo>
+                  <label style='display:inline;margin:0 6px 0 0'><input type=checkbox name=confirm value=yes> confirm overwrite</label>
+                  <button class=del>Overwrite DB from panel</button></form></div>""")
         blocks += (f"""<div class=card><h2>{label} <span class=muted>({h(serial)})</span></h2>
           <table><tr><th>Item</th><th>Status</th><th>Detail</th></tr>
           {''.join(_facet(l, fct) for l, fct in facets)}</table>{acldetail}
           <div style='margin-top:12px;display:flex;gap:8px;flex-wrap:wrap'>
-            {btn('settime','Set date/time')}{btn('syncdoors','Sync doors')}{aclbtn}</div>
-          <p class=muted style='margin-top:8px'>These push the Access UI&rsquo;s saved config to the panel. The panel keeps its
-          old settings until you do. &ldquo;Sync ACL&rdquo; makes the panel&rsquo;s card list exactly match the DB (extra cards are removed).</p>
+            {btn('settime','Set date/time')}{btn('syncdoors','Sync doors')}{aclbtn}
+            <a href='?adopt={escape(serial)}' style='align-self:center;color:var(--muted)'>reverse: adopt panel &rarr; DB&hellip;</a></div>
+          <p class=muted style='margin-top:8px'>The top actions push the Access UI&rsquo;s saved config to the panel (the panel keeps its
+          old settings until you do; &ldquo;Sync ACL&rdquo; makes the panel&rsquo;s card list match the DB). &ldquo;Adopt&rdquo; is the reverse
+          &mdash; it overwrites the DB to match the live panel, for when the panel is the source of truth.</p>
+          {adopt_html}
         </div>""")
     if not cfg:
         blocks = "<p class=muted>No controllers in the service config.</p>"

@@ -261,6 +261,103 @@ def sync_status(serial, conf=None, timeout=6):
     return st
 
 
+def _write_store(name, obj):
+    """Atomically rewrite one uhppoted-httpd system store, owner-only. Caller reloads httpd after."""
+    path = os.path.join(HTTPD_SYS, name)
+    tmp = path + ".portcullis.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _next_oid(items, prefix):
+    mx = 0
+    for it in items:
+        oid = it.get("OID", "")
+        if oid.startswith(prefix + "."):
+            try:
+                mx = max(mx, int(oid.rsplit(".", 1)[1]))
+            except ValueError:
+                pass
+    return f"{prefix}.{mx + 1}"
+
+
+def adopt_from_controller(serial, conf=None, dry_run=True):
+    """Reverse sync: read the panel live and overwrite the Access UI DB's controller-derived fields
+    (door mode/delay, and the full card list incl. validity + per-door access) so the DB mirrors the
+    panel. Break-glass recovery for when the panel is the source of truth. Returns a change summary;
+    with dry_run=False it writes the stores (caller must reload httpd)."""
+    conf = conf or os.environ.get("PORTCULLIS_CONF", "/etc/uhppoted/uhppoted.conf")
+    cur = controller_acl(serial, conf)
+    if cur is None:
+        return {"error": "controller unreachable"}
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    doors = _httpd_json("doors.json").get("doors", [])
+    groups = _httpd_json("groups.json").get("groups", [])
+    cards = _httpd_json("cards.json").get("cards", [])
+    oid_pos = _door_oid_to_pos(serial)
+    pos_oid = {p: o for o, p in oid_pos.items()}
+    door_name = {d.get("OID"): (d.get("name") or "").strip() for d in doors}
+    by_oid = {d.get("OID"): d for d in doors}
+
+    door_changes = []
+    for pos, doid in sorted(pos_oid.items()):
+        rc1, o1 = cli(conf, "get-door-control", str(serial), str(pos))
+        rc2, o2 = cli(conf, "get-door-delay", str(serial), str(pos))
+        if rc1 != 0 or rc2 != 0:
+            continue
+        mode = re.search(r"\(([^)]+)\)", o1).group(1).lower() if "(" in o1 else ""
+        dm = re.search(r"(\d+)\s*$", o2)
+        delay = int(dm.group(1)) if dm else None
+        rec = by_oid.get(doid)
+        if rec and mode and delay is not None and (rec.get("mode") != mode or int(rec.get("delay") or 0) != delay):
+            door_changes.append(f"door {pos}: {rec.get('mode')}/{rec.get('delay')}s -> {mode}/{delay}s")
+            if not dry_run:
+                rec["mode"], rec["delay"], rec["modified"] = mode, delay, now
+
+    def group_for_door(doid):
+        g = next((x for x in groups if x.get("doors") == [doid]), None)
+        if g:
+            return g["OID"]
+        if dry_run:
+            return f"(new:{door_name.get(doid, doid)})"
+        oid = _next_oid(groups, "0.5")
+        groups.append({"OID": oid, "name": door_name.get(doid) or f"Door {doid}", "doors": [doid],
+                       "created": now, "modified": ""})
+        return oid
+
+    by_num = {str(c.get("card")): c for c in cards}
+    adds, updates, removes = [], [], []
+    for num, info in cur.items():
+        gids = [group_for_door(pos_oid[p]) for p in sorted(info["doors"]) if p in pos_oid]
+        existing = by_num.get(num)
+        if existing:
+            updates.append(num)
+            if not dry_run:
+                existing.update(**{"from": info["from"]}, to=info["to"], groups=gids, modified=now)
+                if not existing.get("name"):
+                    existing["name"] = f"Card {num}"
+        else:
+            adds.append(num)
+            if not dry_run:
+                cards.append({"OID": _next_oid(cards, "0.4"), "name": f"Card {num}", "card": int(num),
+                              "from": info["from"], "to": info["to"], "groups": gids,
+                              "created": now, "modified": ""})
+    for c in list(cards):
+        if str(c.get("card")) not in cur:
+            removes.append(str(c.get("card")))
+            if not dry_run:
+                cards.remove(c)
+
+    if not dry_run:
+        _write_store("doors.json", {"doors": doors})
+        _write_store("groups.json", {"groups": groups})
+        _write_store("cards.json", {"cards": cards})
+    return {"dry_run": dry_run, "door_changes": door_changes,
+            "cards_add": adds, "cards_update": updates, "cards_remove": removes}
+
+
 def discover_onvif(timeout=3):
     """Broadcast an ONVIF WS-Discovery probe and return discovered camera endpoints [{ip, xaddr}].
     Pure-stdlib UDP multicast — most IP cameras (Hikvision/Dahua/ONVIF) answer with their address."""
