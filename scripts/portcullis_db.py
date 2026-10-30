@@ -29,7 +29,13 @@ CREATE TABLE IF NOT EXISTS meetings(id INTEGER PRIMARY KEY AUTOINCREMENT, name T
 CREATE TABLE IF NOT EXISTS cameras(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, ip TEXT,
     username TEXT, door INTEGER, rtsp TEXT, password TEXT, channel TEXT DEFAULT '101');
 CREATE TABLE IF NOT EXISTS snapshots(idx INTEGER PRIMARY KEY, path TEXT, camera TEXT, taken_at TEXT);
+CREATE TABLE IF NOT EXISTS peripherals(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, controller TEXT,
+    door INTEGER, name TEXT, model TEXT, ip TEXT, notes TEXT, created TEXT);
 """
+
+# Peripheral kinds the Devices inventory tracks. Cameras keep their own richer table (credentials +
+# snapshot test); keypads are read live from the controller's door flags; the rest are manual items.
+PERIPHERAL_KINDS = ("lock", "closer", "reader", "sensor", "keypad", "other")
 
 
 _schema_done = False
@@ -135,6 +141,63 @@ def card_names():
     """card-number (as text) -> holder name, from the Access UI's card store."""
     return {str(c.get("card")): (c.get("name") or "").strip()
             for c in _httpd_json("cards.json").get("cards", []) if c.get("card")}
+
+
+def door_keypads(serial=None):
+    """Door positions (1..4) the Access UI flags as having a keypad, for the given controller."""
+    oid_keypad = {d.get("OID"): bool(d.get("keypad"))
+                  for d in _httpd_json("doors.json").get("doors", []) if d.get("OID")}
+    ctrls = httpd_controllers()
+    chosen = next((c for c in ctrls if c["serial"] == str(serial)), None) if serial else None
+    if chosen is None:
+        chosen = next((c for c in ctrls if c["address"]), None) or (ctrls[0] if ctrls else {})
+    doors = chosen.get("doors", {}) if chosen else {}
+    return {n for n in (1, 2, 3, 4) if oid_keypad.get(doors.get(str(n), ""))}
+
+
+def discover_onvif(timeout=3):
+    """Broadcast an ONVIF WS-Discovery probe and return discovered camera endpoints [{ip, xaddr}].
+    Pure-stdlib UDP multicast — most IP cameras (Hikvision/Dahua/ONVIF) answer with their address."""
+    import socket, uuid, time as _t
+    probe = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"'
+        ' xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+        ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"'
+        ' xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><e:Header>'
+        f'<w:MessageID>uuid:{uuid.uuid4()}</w:MessageID>'
+        '<w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>'
+        '<w:Action e:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>'
+        '</e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe>'
+        '</e:Body></e:Envelope>')
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    s.settimeout(timeout)
+    found = {}
+    try:
+        s.sendto(probe.encode(), ("239.255.255.250", 3702))
+        end = _t.time() + timeout
+        while _t.time() < end:
+            try:
+                data, addr = s.recvfrom(65535)
+            except (socket.timeout, OSError):
+                break
+            text = data.decode("utf-8", "replace")
+            xa = re.search(r"XAddrs>([^<]+)<", text)
+            urls = xa.group(1).split() if xa else []
+            ip = addr[0]
+            for u in urls:
+                m = re.search(r"https?://([\d.]+)", u)
+                if m:
+                    ip = m.group(1)
+                    break
+            found.setdefault(ip, {"ip": ip, "xaddr": urls[0] if urls else "", "src": addr[0]})
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return list(found.values())
 
 
 def attendance(con, days=30):

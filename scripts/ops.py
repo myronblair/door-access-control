@@ -161,7 +161,8 @@ button.del{background:#3a1f22;color:#e5484d;padding:5px 10px;font-weight:700}
 </nav><main>{% if err %}<p class=err>{{err}}</p>{% endif %}{{ body|safe }}</main></body></html>"""
 
 PAGES = [("dashboard", "Dashboard"), ("events", "Events"), ("attendance", "Attendance"),
-         ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"), ("controllers", "Controllers"), ("settings", "Settings")]
+         ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"),
+         ("devices", "Devices"), ("controllers", "Controllers"), ("settings", "Settings")]
 
 
 def page(active, title, body):
@@ -391,6 +392,106 @@ def settings():
     <div class=card><h2>Listener guard (anti phone-home)</h2>
       <p class=muted>Controlled by the door-control service on :8082 — <code>/guard/on</code>, <code>/guard/off</code>, <code>/guard/enforce</code> (Bearer token). Currently enforced to this host.</p></div>"""
     return page("settings", "Settings", body)
+
+
+def known_controllers():
+    """serial -> label ('name (serial)'), merging the Access UI store and the daemon config."""
+    out = {}
+    for c in pdb.httpd_controllers():
+        if c["serial"]:
+            out[c["serial"]] = f"{c['name'] or 'controller'} ({c['serial']})"
+    for s in pdb.configured_controllers(CONF):
+        out.setdefault(s, f"controller ({s})")
+    return out
+
+
+@app.route("/devices", methods=["GET", "POST"])
+def devices():
+    c = db()
+    if request.method == "POST":
+        f = request.form
+        if f.get("del", "").isdigit():
+            c.execute("DELETE FROM peripherals WHERE id=?", (f["del"],))
+            c.commit(); return redirect(url_for("devices"))
+        if f.get("addcam", "").strip():                      # promote a discovered camera to the Cameras page
+            ip = f.get("addcam", "").strip()
+            if pdb.valid_host(ip):
+                c.execute("INSERT INTO cameras(name,ip,username,password,door,channel,rtsp) VALUES(?,?,?,?,?,?,?)",
+                          (ip, ip, "admin", "", 1, "101", ""))
+                c.commit()
+            return redirect(url_for("cameras", err="Camera added with defaults — set its password and door on this page."))
+        kind = f.get("kind", "").strip().lower()
+        name = f.get("name", "").strip()
+        ctrl = f.get("controller", "").strip()
+        door = f.get("door", "").strip()
+        ip   = f.get("ip", "").strip()
+        if kind not in pdb.PERIPHERAL_KINDS or not name:
+            return bad("devices", "An item needs a name and a valid type.")
+        if door and not valid_door(door):
+            return bad("devices", "Door must be 1-4 (or left blank).")
+        if ctrl and not ctrl.isdigit():
+            return bad("devices", "Controller must be a serial number.")
+        if ip and not pdb.valid_host(ip):
+            return bad("devices", "IP/host is not valid.")
+        c.execute("INSERT INTO peripherals(kind,controller,door,name,model,ip,notes,created) VALUES(?,?,?,?,?,?,?,?)",
+                  (kind, ctrl, int(door) if door else None, name[:60], f.get("model", "").strip()[:60],
+                   ip, f.get("notes", "").strip()[:200], datetime.datetime.now().isoformat(timespec="seconds")))
+        c.commit(); return redirect(url_for("devices"))
+
+    kctrl = known_controllers()
+    rows = ""
+    # cameras (managed on the Cameras page) — shown here for a complete inventory
+    for m in c.execute("SELECT * FROM cameras ORDER BY name"):
+        rows += (f"<tr><td>Camera</td><td>{h(m['name'])}</td><td class=muted>—</td><td>{door_name(m['door'])}</td>"
+                 f"<td>{h(m['ip'])}</td><td class=muted>manage on Cameras page</td><td></td></tr>")
+    # keypads — read live from the controller's door flags (Access UI)
+    for n in sorted(pdb.door_keypads()):
+        rows += (f"<tr><td>Keypad</td><td>{door_name(n)} keypad</td><td class=muted>—</td><td>{door_name(n)}</td>"
+                 f"<td class=muted>—</td><td class=muted>from Access UI door settings</td><td></td></tr>")
+    # manual inventory items
+    for p in c.execute("SELECT * FROM peripherals ORDER BY kind, name"):
+        loc = kctrl.get(p["controller"] or "", h(p["controller"]) if p["controller"] else "<span class=muted>—</span>")
+        meta = " · ".join(x for x in (h(p["model"]) if p["model"] else "", h(p["ip"]) if p["ip"] else "") if x) or "<span class=muted>—</span>"
+        rows += (f"<tr><td>{h(p['kind'].title())}</td><td>{h(p['name'])}</td><td>{loc}</td>"
+                 f"<td>{door_name(p['door']) if p['door'] else '<span class=muted>—</span>'}</td>"
+                 f"<td>{meta}</td><td>{h(p['notes'])}</td><td>{delete_form('del', p['id'])}</td></tr>")
+    rows = rows or "<tr><td colspan=7 class=muted>no devices yet</td></tr>"
+
+    ksel = "".join(f"<option value={k}>{k.title()}</option>" for k in pdb.PERIPHERAL_KINDS if k != "keypad")
+    csel = "<option value=''>— none —</option>" + "".join(
+        f"<option value={escape(s)}>{escape(l)}</option>" for s, l in sorted(kctrl.items()))
+    dsel = "<option value=''>— n/a —</option>" + "".join(f"<option value={n}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
+
+    disc = pdb.discover_onvif() if request.args.get("discover") else None
+    disc_html = "<p class=muted>Scan the LAN for ONVIF/IP cameras. Keypads, locks and closers are wired to the controller and are not network-discoverable — add those below.</p>"
+    if disc is not None:
+        have = {m["ip"] for m in c.execute("SELECT ip FROM cameras")}
+        drows = ""
+        for d in disc:
+            act = ("<span class=muted>already a camera</span>" if d["ip"] in have else
+                   f"<form method=post style=display:inline><input type=hidden name=addcam value='{escape(d['ip'])}'><button>Add as camera</button></form>")
+            drows += f"<tr><td>{escape(d['ip'])}</td><td class=muted>{escape(d.get('xaddr',''))}</td><td>{act}</td></tr>"
+        drows = drows or "<tr><td colspan=3 class=muted>no cameras answered the ONVIF probe</td></tr>"
+        disc_html = "<table><tr><th>IP</th><th>ONVIF endpoint</th><th></th></tr>" + drows + "</table>"
+
+    body = f"""<h1>Devices</h1>
+    <p class=muted>Every camera, keypad, lock, closer, reader and sensor tied to your controllers, in one inventory.</p>
+    <table><tr><th>Type</th><th>Name</th><th>Controller</th><th>Door</th><th>Model / IP</th><th>Notes</th><th></th></tr>{rows}</table>
+    <div class=card><h2>Discover cameras on the network</h2>
+      <form method=get><input type=hidden name=discover value=1><button>Scan for cameras (ONVIF)</button></form>
+      {disc_html}</div>
+    <div class=card><h2>Add item</h2><form class=row method=post>
+      <div><label>type</label><select name=kind>{ksel}</select></div>
+      <div><label>name</label><input name=name required></div>
+      <div><label>controller</label><select name=controller>{csel}</select></div>
+      <div><label>door</label><select name=door>{dsel}</select></div>
+      <div><label>make / model</label><input name=model></div>
+      <div><label>IP (optional)</label><input name=ip placeholder="10.48.200.x"></div>
+      <div><label>notes</label><input name=notes></div>
+      <button>Add</button></form>
+      <p class=muted>Cameras are added from the scan above (or the Cameras page) so their credentials can be tested;
+      keypads come from the Access UI door settings automatically.</p></div>"""
+    return page("devices", "Devices", body)
 
 
 @app.route("/controllers", methods=["GET", "POST"])
