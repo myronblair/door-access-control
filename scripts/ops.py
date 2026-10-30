@@ -483,6 +483,12 @@ def cameras():
         if f.get("del", "").isdigit():
             c.execute("DELETE FROM cameras WHERE id=?", (f["del"],)); audit("delete camera", f["del"])
             c.commit(); return redirect(url_for("cameras"))
+        if f.get("addcam", "").strip():                   # promote an ONVIF-discovered camera
+            ip = f.get("addcam", "").strip()
+            if pdb.valid_host(ip):
+                c.execute("INSERT INTO cameras(name,ip,username,password,door,channel,rtsp) VALUES(?,?,?,?,?,?,?)",
+                          (ip, ip, "admin", "", 1, "101", "")); c.commit(); audit("add camera (ONVIF)", ip)
+            return redirect(url_for("cameras", err="Camera added with defaults — set its password and door below, then Test."))
         name, ip, ch = f.get("name", "").strip(), f.get("ip", "").strip(), f.get("channel", "").strip() or "101"
         if not name or not pdb.valid_host(ip) or not ch.isdigit() or not valid_door(f.get("door")):
             return bad("cameras", "Camera needs a name, a valid IP/hostname, a numeric channel and a door.")
@@ -510,11 +516,24 @@ def cameras():
         f"<td><form method=post action='{url_for('camera_test', cid=m['id'])}' target=_blank style=display:inline>"
         f"<button class=del>test</button></form></td>"
         f"{row_actions('edit', 'del', m['id'])}</tr>" for m in cams) or "<tr><td colspan=8 class=muted>no cameras</td></tr>"
+    disc = pdb.discover_onvif() if request.args.get("discover") else None
+    disc_html = "<p class=muted>Scan the LAN for ONVIF/IP cameras. Keypads, locks and closers are wired to the controller and aren't network-discoverable — add those on the Devices page.</p>"
+    if disc is not None:
+        have = {m["ip"] for m in cams}
+        drows = "".join(
+            f"<tr><td>{escape(d['ip'])}</td><td class=muted>{escape(d.get('xaddr',''))}</td><td>"
+            + ("<span class=muted>already a camera</span>" if d["ip"] in have else
+               f"<form method=post style=display:inline><input type=hidden name=addcam value='{escape(d['ip'])}'><button>Add as camera</button></form>")
+            + "</td></tr>" for d in disc) or "<tr><td colspan=3 class=muted>no cameras answered the ONVIF probe</td></tr>"
+        disc_html = "<table><tr><th>IP</th><th>ONVIF endpoint</th><th></th></tr>" + drows + "</table>"
     eid = f"<input type=hidden name=id value={ed['id']}>" if ed else ""
     cancel = f" <a href='{url_for('cameras')}' style='align-self:center;color:var(--muted)'>cancel</a>" if ed else ""
     body = f"""<h1>Cameras</h1>
     <p class=muted>Hikvision ISAPI. A camera linked to a door gets an auto-snapshot when that door fires an event (shown on the Events page with &#128247;). Snapshots are kept for 30 days.</p>
     <table><tr><th>Name</th><th>IP</th><th>User</th><th>Pass</th><th>Ch</th><th>Door</th><th>Test</th><th></th></tr>{rows}</table>
+    <div class=card><h2>Discover cameras on the network</h2>
+      <form method=get><input type=hidden name=discover value=1><button>Scan for cameras (ONVIF)</button></form>
+      {disc_html}</div>
     <div class=card><h2>{'Edit' if ed else 'Add'} camera</h2><form class=row method=post>{eid}
       <div><label>name</label><input name=name required value="{h(ed['name']) if ed else ''}"></div>
       <div><label>IP</label><input name=ip placeholder="10.48.200.x" required value="{h(ed['ip']) if ed else ''}"></div>
@@ -964,13 +983,15 @@ def devices():
         if f.get("del", "").isdigit():
             c.execute("DELETE FROM peripherals WHERE id=?", (f["del"],)); audit("delete device", f["del"])
             c.commit(); return redirect(url_for("devices"))
-        if f.get("addcam", "").strip():                      # promote a discovered camera to the Cameras page
-            ip = f.get("addcam", "").strip()
-            if pdb.valid_host(ip):
-                c.execute("INSERT INTO cameras(name,ip,username,password,door,channel,rtsp) VALUES(?,?,?,?,?,?,?)",
-                          (ip, ip, "admin", "", 1, "101", ""))
-                c.commit(); audit("add camera (ONVIF)", ip)
-            return redirect(url_for("cameras", err="Camera added with defaults — set its password and door on this page."))
+        if f.get("adddev"):                                  # add a device found by the controller scan
+            k, s, pos, nm = (f.get("kind", "").strip().lower(), f.get("controller", "").strip(),
+                             f.get("door", "").strip(), f.get("name", "").strip())
+            if k in pdb.PERIPHERAL_KINDS and nm and (not pos or valid_door(pos)):
+                c.execute("INSERT INTO peripherals(kind,controller,door,name,model,ip,notes,created) VALUES(?,?,?,?,?,?,?,?)",
+                          (k, s, int(pos) if pos else None, nm[:60], "", "", "detected by scan",
+                           datetime.datetime.now().isoformat(timespec="seconds")))
+                c.commit(); audit("add device (scan)", f"{k} {nm}")
+            return redirect(url_for("devices", scandev=1))
         kind = f.get("kind", "").strip().lower()
         name = f.get("name", "").strip()
         ctrl = f.get("controller", "").strip()
@@ -1024,24 +1045,38 @@ def devices():
     dsel = "<option value=''>— n/a —</option>" + "".join(
         f"<option value={n}{' selected' if ed and ed['door']==n else ''}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
 
-    disc = pdb.discover_onvif() if request.args.get("discover") else None
-    disc_html = "<p class=muted>Scan the LAN for ONVIF/IP cameras. Keypads, locks and closers are wired to the controller and are not network-discoverable — add those below.</p>"
-    if disc is not None:
-        have = {m["ip"] for m in c.execute("SELECT ip FROM cameras")}
-        drows = ""
-        for d in disc:
-            act = ("<span class=muted>already a camera</span>" if d["ip"] in have else
-                   f"<form method=post style=display:inline><input type=hidden name=addcam value='{escape(d['ip'])}'><button>Add as camera</button></form>")
-            drows += f"<tr><td>{escape(d['ip'])}</td><td class=muted>{escape(d.get('xaddr',''))}</td><td>{act}</td></tr>"
-        drows = drows or "<tr><td colspan=3 class=muted>no cameras answered the ONVIF probe</td></tr>"
-        disc_html = "<table><tr><th>IP</th><th>ONVIF endpoint</th><th></th></tr>" + drows + "</table>"
+    scan_html = ("<p class=muted>Scan your controllers for the devices wired to them — readers, keypads and door "
+                 "locks are inferred from each controller's door configuration (keypads from the door's keypad flag). "
+                 "Cameras are network devices — discover those on the Cameras page.</p>")
+    if request.args.get("scandev"):
+        existing = {(p["kind"], p["controller"] or "", p["door"])
+                    for p in c.execute("SELECT kind,controller,door FROM peripherals")}
+        srows = ""
+        for serial in pdb.configured_controllers(CONF):
+            km, dn = pdb.door_keypads(serial), pdb.door_names(serial)
+            for pos in sorted(pdb.intended_doors(serial)):
+                items = [("reader", f"{dn[pos]} reader"), ("lock", f"{dn[pos]} lock / strike")]
+                if pos in km:
+                    items.insert(1, ("keypad", f"{dn[pos]} keypad"))
+                for k, nm in items:
+                    inv = (k, serial, pos) in existing or k == "keypad"   # keypads are already auto-listed above
+                    act = ("<span class=muted>in inventory</span>" if inv else
+                           f"<form method=post style=display:inline><input type=hidden name=adddev value=1>"
+                           f"<input type=hidden name=kind value={k}><input type=hidden name=controller value='{escape(serial)}'>"
+                           f"<input type=hidden name=door value={pos}><input type=hidden name=name value='{escape(nm)}'>"
+                           f"<button>Add</button></form>")
+                    srows += (f"<tr><td>{k.title()}</td><td>{h(nm)}</td><td>{h(kctrl.get(serial, serial))}</td>"
+                              f"<td>{door_name(pos, serial)}</td><td>{act}</td></tr>")
+        srows = srows or "<tr><td colspan=5 class=muted>no assigned doors found on any controller</td></tr>"
+        scan_html = ("<table><tr><th>Type</th><th>Suggested name</th><th>Controller</th><th>Door</th><th></th></tr>"
+                     + srows + "</table>")
 
     body = f"""<h1>Devices</h1>
     <p class=muted>Every camera, keypad, lock, closer, reader and sensor tied to your controllers, in one inventory.</p>
     <table><tr><th>Type</th><th>Name</th><th>Controller</th><th>Door</th><th>Model / IP</th><th>Notes</th><th></th></tr>{rows}</table>
-    <div class=card><h2>Discover cameras on the network</h2>
-      <form method=get><input type=hidden name=discover value=1><button>Scan for cameras (ONVIF)</button></form>
-      {disc_html}</div>"""
+    <div class=card><h2>Scan controllers for attached devices</h2>
+      <form method=get><input type=hidden name=scandev value=1><button>Scan controllers</button></form>
+      {scan_html}</div>"""
     eid = f"<input type=hidden name=id value={ed['id']}>" if ed else ""
     cancel = f" <a href='{url_for('devices')}' style='align-self:center;color:var(--muted)'>cancel</a>" if ed else ""
     body += f"""<div class=card><h2>{'Edit' if ed else 'Add'} item</h2><form class=row method=post>{eid}
