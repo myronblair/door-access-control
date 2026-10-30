@@ -28,22 +28,28 @@ CREATE TABLE IF NOT EXISTS snapshots(idx INTEGER PRIMARY KEY, path TEXT, camera 
 """
 
 
+_schema_done = False
+
+
 def connect(row_factory=None):
-    """Open the database, creating/upgrading the schema. The file is kept owner-only (it holds
-    camera credentials)."""
+    """Open the database (creating/upgrading the schema once per process). The file is kept
+    owner-only (it holds camera credentials)."""
+    global _schema_done
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     con = sqlite3.connect(DB, timeout=15)
     if row_factory:
         con.row_factory = row_factory
-    con.executescript(_SCHEMA)
-    cols = [r[1] for r in con.execute("PRAGMA table_info(cameras)")]
-    if "password" not in cols: con.execute("ALTER TABLE cameras ADD COLUMN password TEXT")
-    if "channel"  not in cols: con.execute("ALTER TABLE cameras ADD COLUMN channel TEXT DEFAULT '101'")
-    con.commit()
-    try:
-        os.chmod(DB, 0o600)
-    except OSError:
-        pass
+    if not _schema_done:                        # schema init is once-per-process, not per request
+        con.executescript(_SCHEMA)
+        cols = [r[1] for r in con.execute("PRAGMA table_info(cameras)")]
+        if "password" not in cols: con.execute("ALTER TABLE cameras ADD COLUMN password TEXT")
+        if "channel"  not in cols: con.execute("ALTER TABLE cameras ADD COLUMN channel TEXT DEFAULT '101'")
+        con.commit()
+        try:
+            os.chmod(DB, 0o600)
+        except OSError:
+            pass
+        _schema_done = True
     return con
 
 

@@ -74,17 +74,23 @@ def parse(out):
         return None
 
 
+_skew = {"val": 0.0, "ts": 0.0}
+
+
 def controller_skew():
-    """Seconds the controller's clock is ahead of this host (0 if it can't be read)."""
+    """Seconds the controller's clock is ahead of this host (0 if it can't be read). Cached for
+    5 min — the offset drifts slowly and each read is a controller round-trip."""
+    if time.time() - _skew["ts"] < 300:
+        return _skew["val"]
     try:
         rc, out = cli("get-time", SERIAL, t=8)
         m = re.search(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})", out)
         if rc == 0 and m:
             ctrl = datetime.datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
-            return (ctrl - datetime.datetime.now()).total_seconds()
+            _skew.update(val=(ctrl - datetime.datetime.now()).total_seconds(), ts=time.time())
     except Exception:
         pass
-    return 0.0
+    return _skew["val"]
 
 
 def camera_map(con):
@@ -111,7 +117,7 @@ def snapshot_fresh(con, fresh):
         except ValueError:
             return None
 
-    cand = [f for f in cand if (age(f[2]) is not None and age(f[2]) <= SNAP_MAX_AGE)]
+    cand = [f for f in cand if (a := age(f[2])) is not None and a <= SNAP_MAX_AGE]
     if not cand:
         return
     def shot(f):

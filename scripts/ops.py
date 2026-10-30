@@ -39,9 +39,9 @@ def gate():
         who = request.headers.get("Cf-Access-Authenticated-User-Email", "").strip().lower()
         if not who or (ALLOW and who not in ALLOW):
             abort(403)
-    if request.method == "POST":                       # CSRF: same-host posts only
-        src = request.headers.get("Origin") or request.headers.get("Referer") or ""
-        if urlsplit(src).hostname != (request.host.split(":")[0] or None):
+    if request.method == "POST":                       # CSRF: reject only explicit cross-origin posts
+        src = request.headers.get("Origin") or request.headers.get("Referer")
+        if src and urlsplit(src).hostname != request.host.split(":")[0]:
             abort(403)
 
 
