@@ -37,23 +37,34 @@ footer{color:var(--footer-text-colour);background:var(--footer-background-colour
 ::-webkit-scrollbar-thumb{background:#2a3542;border-radius:8px;border:2px solid #0f141b}
 ::-webkit-scrollbar-track{background:#0b0f14}
 
+
+
 /* ===== Portcullis consistency — match the Ops look (typography, nav, tables) ===== */
 :root{--pc-bg:#0f141b;--pc-panel:#161d27;--pc-line:#2a3542;--pc-brass:#e0b23b;--pc-text:#e6edf3;--pc-muted:#8b98a5}
-body,input,select,textarea,button,table,th,td,h1,h2,h3,legend,nav,.title,.tabular{
-  font-family:'Lato',system-ui,-apple-system,sans-serif !important}
-body{font-size:15px;line-height:1.5;color:var(--pc-text)}
-/* nav as Ops pills */
-nav ul{display:flex;flex-wrap:wrap;gap:4px;list-style:none;margin:0;padding:10px 16px;background:#0b0f14;border-bottom:1px solid var(--pc-line)}
-nav li{list-style:none}
-nav li a,nav li.selected{display:block;padding:7px 13px;border-radius:8px;font-weight:700;font-size:13px;letter-spacing:.3px;text-decoration:none}
-nav li a{color:var(--pc-muted)}
-nav li a:hover{color:var(--pc-text);background:#161d27}
-nav li.selected{color:#0f141b;background:var(--pc-brass);font-weight:800}
-/* tables to match Ops */
-main table,.tabular table{background:var(--pc-panel);border:1px solid var(--pc-line);border-radius:10px;border-collapse:separate;border-spacing:0;overflow:hidden}
-thead th,th.colheader,th.topleft{background:#1b2531 !important;color:var(--pc-brass) !important;
-  text-transform:uppercase;letter-spacing:.4px;font-size:12px !important;font-weight:800 !important}
-tbody td{font-size:14px;border-bottom:1px solid var(--pc-line)}
+body, body * { font-family:'Lato', system-ui, -apple-system, sans-serif !important; }
+html body { font-size:15px; line-height:1.5; color:var(--pc-text); }
+/* nav pills — beat base "nav ul li a" / "nav ul li.selected" */
+nav ul { display:flex !important; flex-wrap:wrap; gap:4px; align-items:center; list-style:none; margin:0; padding:10px 16px; }
+nav ul li { color:var(--pc-muted) !important; border-radius:8px; list-style:none; }
+nav ul li a { color:var(--pc-muted) !important; display:block; padding:7px 13px; border-radius:8px;
+  font-weight:700 !important; font-size:13px !important; letter-spacing:.3px; text-decoration:none; }
+nav ul li a:hover { color:var(--pc-text) !important; background:#161d27 !important; }
+nav ul li.selected { color:#0f141b !important; background:var(--pc-brass) !important; padding:7px 13px;
+  border-radius:8px; font-weight:800 !important; font-size:13px !important; letter-spacing:.3px; }
+/* table headers brass/uppercase — beat "div.tabular table thead tr th" */
+div.tabular table { background:var(--pc-panel) !important; border:1px solid var(--pc-line) !important; border-radius:10px; }
+div.tabular table thead th,
+div.tabular table thead tr th { background:#1b2531 !important; color:var(--pc-brass) !important;
+  text-transform:uppercase !important; letter-spacing:.4px !important; font-size:12px !important; font-weight:800 !important; }
+div.tabular table tbody td { font-size:14px !important; border-bottom:1px solid var(--pc-line) !important; }
 /* legends / titles in brass */
-legend,.title,h1,h2,h3{color:var(--pc-brass)}
-legend{font-weight:800;letter-spacing:.5px;text-transform:uppercase}
+legend, h1, h2, h3 { color:var(--pc-brass) !important; font-weight:800; letter-spacing:.5px; }
+/* login page — explicit (beats html.login #login … + themes the box) */
+:root{--fieldset-border:1px solid var(--pc-line);--fieldset-text:var(--pc-text);--fieldset-button-border:none;--field-border:1px solid var(--pc-line);--field-input-background:var(--pc-bg)}
+html.login{background:var(--pc-bg) !important}
+html.login #login{background:var(--pc-panel) !important;border:1px solid var(--pc-line) !important;border-radius:14px !important;box-shadow:0 16px 48px rgba(0,0,0,.5);padding:22px !important}
+html.login #login legend{color:var(--pc-brass) !important;font-style:normal !important;font-weight:800 !important;letter-spacing:.5px;text-transform:uppercase;font-size:.95em !important}
+html.login .field{background:var(--pc-bg) !important;border:1px solid var(--pc-line) !important;border-radius:8px !important}
+html.login .field>input{background:transparent !important;color:var(--pc-text) !important}
+html.login .field>input::placeholder{color:var(--pc-muted) !important}
+html.login form button{background:var(--pc-brass) !important;color:#0f141b !important;border:none !important;border-radius:8px !important;font-weight:800 !important;font-size:.85em !important;min-width:120px;cursor:pointer}
