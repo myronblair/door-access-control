@@ -39,6 +39,7 @@ footer{color:var(--footer-text-colour);background:var(--footer-background-colour
 
 
 
+
 /* ===== Portcullis consistency — match the Ops look (typography, nav, tables) ===== */
 :root{--pc-bg:#0f141b;--pc-panel:#161d27;--pc-line:#2a3542;--pc-brass:#e0b23b;--pc-text:#e6edf3;--pc-muted:#8b98a5}
 body, body * { font-family:'Lato', system-ui, -apple-system, sans-serif !important; }
@@ -68,3 +69,7 @@ html.login .field{background:var(--pc-bg) !important;border:1px solid var(--pc-l
 html.login .field>input{background:transparent !important;color:var(--pc-text) !important}
 html.login .field>input::placeholder{color:var(--pc-muted) !important}
 html.login form button{background:var(--pc-brass) !important;color:#0f141b !important;border:none !important;border-radius:8px !important;font-weight:800 !important;font-size:.85em !important;min-width:120px;cursor:pointer}
+/* make typed + autofilled login text visible (override browser forced dark text) */
+html.login .field>input, html.login .field>input:focus, html.login .field>input:-webkit-autofill{
+  color:var(--pc-text) !important; -webkit-text-fill-color:var(--pc-text) !important; caret-color:var(--pc-brass) !important; opacity:1 !important}
+html.login .field>input:-webkit-autofill{-webkit-box-shadow:0 0 0 1000px var(--pc-panel) inset !important}
