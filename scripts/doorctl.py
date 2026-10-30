@@ -1,48 +1,52 @@
 #!/usr/bin/env python3
-"""Portcullis door control + listener guard.
+"""Portcullis door control + listener guard (multi-controller).
 
-Two jobs, one small token-authenticated HTTP service (LAN-only, firewalled to HA + JARVIS):
+A small token-authenticated HTTP service (LAN-only, firewalled to HA + JARVIS):
 
   Door unlock (cardless, via `uhppote-cli open`):
-    POST /open/<1-4>            unlock a door                       [Bearer token]
+    POST /open/<1-4>              unlock a door on the primary controller          [Bearer token]
+    POST /open/<serial>/<1-4>     unlock a door on a specific controller           [Bearer token]
 
-  Listener guard — defeats the OEM firmware's phone-home. The controller sends every access
-  event to whatever listener address it's told to; the Chinese iCCard software had pointed it at
-  an Alibaba Cloud server in Shenzhen. The guard keeps it pointed at THIS host ("reroute back into
-  itself"). When enabled, a background thread re-asserts the listener whenever it drifts and logs
-  any foreign/off-LAN target it catches.
-    GET  /guard                status {enabled, listener, self, last_check, last_revert, drift_count, last_foreign}
-    POST /guard/on             enable  (persisted; enforces immediately)      [Bearer token]
-    POST /guard/off            disable (controller left as-is)                [Bearer token]
-    POST /guard/enforce        one-shot: set listener back to self now        [Bearer token]
+  Listener guard — defeats the OEM firmware's phone-home. It keeps EVERY configured controller's
+  event listener pointed at THIS host, re-asserting any that drift and logging foreign targets.
+    GET  /guard                  status (per-controller listeners + counts)        [Bearer token]
+    POST /guard/on               enable (persisted; enforces all controllers now)  [Bearer token]
+    POST /guard/off              disable                                           [Bearer token]
+    POST /guard/enforce          one-shot: re-point every controller to self       [Bearer token]
 
-  GET /health                  liveness (unauthenticated)
+  GET /health                    liveness (unauthenticated)
 
-Copyright (c) 2026 TomTom Enterprises.
+Controllers are discovered from uhppoted.conf, so adding a controller (Ops > Controllers) extends
+the guard automatically. Copyright (c) 2026 TomTom Enterprises.
 """
 import json, subprocess, hmac, os, threading, time, ipaddress, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import portcullis_db as pdb
+
 CONF        = os.environ.get("PORTCULLIS_CONF", "/etc/uhppoted/uhppoted.conf")
-SERIAL      = os.environ.get("PORTCULLIS_SERIAL", "223208728")
+PRIMARY     = os.environ.get("PORTCULLIS_SERIAL", "223208728")   # fallback when the config can't be read
 CLI         = "/usr/local/bin/uhppote-cli"
 PORT        = 8082
 SELF_LISTEN = os.environ.get("PORTCULLIS_LISTENER", "10.48.200.67:60001")  # where events SHOULD go (this VM)
-STATE_FILE  = "/etc/portcullis/guard.enabled"   # presence+content persists on/off
+STATE_FILE  = "/etc/portcullis/guard.enabled"
 LOG_FILE    = "/var/log/portcullis/guard.log"
-CHECK_EVERY = 60                                # seconds between guard checks
+CHECK_EVERY = 60
 TOKEN       = open("/etc/portcullis/doorctl.token").read().strip()
 LAN         = ipaddress.ip_network("10.48.200.0/24")
 
-_state = {"last_check": None, "last_revert": None, "drift_count": 0, "last_foreign": None}
+_state = {"last_check": None, "last_revert": None, "drift_count": 0, "last_foreign": None, "listeners": {}}
 _lock  = threading.Lock()
 
 
+def now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
 def log(msg):
-    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}\n"
     try:
         with open(LOG_FILE, "a") as f:
-            f.write(line)
+            f.write(f"{now()} {msg}\n")
     except OSError:
         pass
 
@@ -52,12 +56,16 @@ def cli(*args, timeout=15):
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
-def get_listener():
-    """Return 'ip:port' the controller currently reports to, or None if unreachable."""
-    rc, out = cli("get-listener", SERIAL)
+def serials():
+    """Every controller serial declared in uhppoted.conf (falls back to the primary)."""
+    return list(pdb.configured_controllers(CONF).keys()) or [PRIMARY]
+
+
+def get_listener(serial):
+    """The 'ip:port' a controller currently reports to, or None if unreachable."""
+    rc, out = cli("get-listener", serial)
     if rc != 0 or not out:
         return None
-    # e.g. "223208728 120.78.216.117:61009 30s"  ->  "120.78.216.117:61009"
     parts = out.split()
     return parts[1] if len(parts) >= 2 and ":" in parts[1] else None
 
@@ -69,25 +77,39 @@ def is_foreign(addr):
         return True
 
 
-def enforce(cur=None):
-    """Set the controller's listener back to this host. Returns (changed, detail).
-    Pass `cur` to reuse a listener value the caller already fetched (avoids a second round-trip)."""
+def enforce(serial, cur=None):
+    """Point one controller's listener back to this host. Returns (changed, detail)."""
     if cur is None:
-        cur = get_listener()
+        cur = get_listener(serial)
     if cur is None:
-        return False, "controller unreachable"
+        return False, f"{serial}: unreachable"
     if cur == SELF_LISTEN:
-        return False, "already self"
+        return False, f"{serial}: already self"
     foreign = is_foreign(cur)
-    rc, out = cli("set-listener", SERIAL, SELF_LISTEN)
+    rc, _ = cli("set-listener", serial, SELF_LISTEN)
     with _lock:
-        _state["last_revert"] = datetime.datetime.now().isoformat(timespec="seconds")
+        _state["last_revert"] = now()
         _state["drift_count"] += 1
         if foreign:
-            _state["last_foreign"] = cur
-    tag = "FOREIGN" if foreign else "lan"
-    log(f"DRIFT ({tag}) listener was {cur} -> reset to {SELF_LISTEN} (rc={rc})")
-    return True, f"reverted {cur} ({tag}) -> {SELF_LISTEN}"
+            _state["last_foreign"] = f"{serial} -> {cur}"
+    log(f"DRIFT ({'FOREIGN' if foreign else 'lan'}) {serial} listener was {cur} -> {SELF_LISTEN} (rc={rc})")
+    return True, f"{serial}: reverted {cur} ({'FOREIGN' if foreign else 'lan'}) -> {SELF_LISTEN}"
+
+
+def enforce_all():
+    """Check every configured controller; re-point any that drifted. Returns {serial: detail}."""
+    out = {}
+    for s in serials():
+        cur = get_listener(s)
+        with _lock:
+            _state["listeners"][s] = cur
+        if cur and cur != SELF_LISTEN:
+            out[s] = enforce(s, cur)[1]
+        else:
+            out[s] = "self" if cur == SELF_LISTEN else "unreachable"
+    with _lock:
+        _state["last_check"] = now()
+    return out
 
 
 def guard_enabled():
@@ -103,16 +125,16 @@ def set_enabled(on):
 
 
 def guard_loop():
+    first = True
     while True:
         if guard_enabled():
             try:
-                cur = get_listener()
-                with _lock:
-                    _state["last_check"] = datetime.datetime.now().isoformat(timespec="seconds")
-                if cur and cur != SELF_LISTEN:
-                    enforce(cur)
+                if first:
+                    log(f"guard enabled, enforcing {len(serials())} controller(s) -> {SELF_LISTEN}")
+                enforce_all()
             except Exception as e:
                 log(f"guard error: {type(e).__name__}: {e}")
+        first = False
         time.sleep(CHECK_EVERY)
 
 
@@ -128,8 +150,7 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authed(self):
-        got, want = self.headers.get("Authorization", ""), "Bearer " + TOKEN
-        return hmac.compare_digest(got, want)   # compare_digest is already length-safe
+        return hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + TOKEN)
 
     def do_GET(self):
         if self.path == "/health":
@@ -140,7 +161,7 @@ class H(BaseHTTPRequestHandler):
             with _lock:
                 st = dict(_state)
             return self._send(200, {"enabled": guard_enabled(), "self": SELF_LISTEN,
-                                    "listener": get_listener(), **st})
+                                    "controllers": serials(), **st})
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -149,21 +170,28 @@ class H(BaseHTTPRequestHandler):
         p = self.path
         if p == "/guard/on":
             set_enabled(True)
-            changed, detail = enforce()
-            return self._send(200, {"enabled": True, "enforced": changed, "detail": detail})
+            return self._send(200, {"enabled": True, "enforced": enforce_all()})
         if p == "/guard/off":
             set_enabled(False)
-            return self._send(200, {"enabled": False, "detail": "guard disabled; controller left as-is"})
+            return self._send(200, {"enabled": False, "detail": "guard disabled; controllers left as-is"})
         if p == "/guard/enforce":
-            changed, detail = enforce()
-            return self._send(200, {"enforced": changed, "detail": detail})
+            return self._send(200, {"enforced": enforce_all()})
         if p.startswith("/open/"):
-            door = p.rsplit("/", 1)[-1]
+            rest = [x for x in p[len("/open/"):].split("/") if x]
+            if len(rest) == 1:
+                serial, door = serials()[0], rest[0]
+            elif len(rest) == 2:
+                serial, door = rest[0], rest[1]
+            else:
+                return self._send(400, {"error": "use /open/<door> or /open/<serial>/<door>"})
             if door not in ("1", "2", "3", "4"):
                 return self._send(400, {"error": "door must be 1-4"})
+            if serial not in serials():
+                return self._send(400, {"error": f"unknown controller {serial}"})
             try:
-                rc, out = cli("open", SERIAL, door)
-                return self._send(200 if rc == 0 else 502, {"ok": rc == 0, "door": int(door), "detail": out[:200]})
+                rc, out = cli("open", serial, door)
+                return self._send(200 if rc == 0 else 502,
+                                  {"ok": rc == 0, "controller": serial, "door": int(door), "detail": out[:200]})
             except Exception as e:
                 return self._send(500, {"ok": False, "error": type(e).__name__})
         self._send(404, {"error": "not found"})
@@ -173,11 +201,7 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if guard_enabled():
-        try:
-            log(f"startup: guard enabled, enforcing -> {SELF_LISTEN}")
-            enforce()
-        except Exception as e:
-            log(f"startup enforce error: {e}")
+    # The HTTP listener comes up immediately; the guard thread does its first enforce pass right away,
+    # so a flapping controller's timeouts never delay the service binding its port.
     threading.Thread(target=guard_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

@@ -48,12 +48,12 @@ def gate():
 
 
 def db():
-    """One connection per request (closed on teardown) with the door-name map loaded once."""
+    """One connection per request (closed on teardown). Door and card-holder names come from the
+    uhppoted-httpd store — the same source the main Access UI uses — so labels never drift."""
     if "db" not in g:
-        c = pdb.connect(pdb.sqlite3.Row)
-        s = {r[0]: r[1] for r in c.execute("SELECT k, v FROM settings")}
-        g.door_map = {n: (s.get(f"door{n}") or f"Door {n}") for n in (1, 2, 3, 4)}
-        g.db = c
+        g.db = pdb.connect(pdb.sqlite3.Row)
+        g.door_map = pdb.door_names()
+        g.card_map = pdb.card_names()
     return g.db
 
 
@@ -70,6 +70,12 @@ def door_name(n):
     except (TypeError, ValueError):
         return f"Door {h(n)}"
     return h(g.door_map.get(n, f"Door {n}"))
+
+
+def card_label(num):
+    """Show the holder's name (from the Access UI) with the raw number, or just the number."""
+    name = g.card_map.get(str(num))
+    return f"{h(name)} <span class=muted>{h(num)}</span>" if name else h(num)
 
 
 def parse_days(default=30):
@@ -179,7 +185,7 @@ def dashboard():
     cards = c.execute("SELECT COUNT(DISTINCT card) n FROM events").fetchone()["n"]
     last  = c.execute("SELECT MAX(ts) t FROM events").fetchone()["t"] or "—"
     recent = c.execute("SELECT * FROM events ORDER BY idx DESC LIMIT 10").fetchall()
-    rows = "".join(f"<tr><td>{h(e['ts'])}</td><td>{h(e['card'])}</td><td>{door_name(e['door'])}</td>"
+    rows = "".join(f"<tr><td>{h(e['ts'])}</td><td>{card_label(e['card'])}</td><td>{door_name(e['door'])}</td>"
                    f"<td class='{'g' if e['granted'] else 'r'}'>{'granted' if e['granted'] else 'denied'}</td></tr>"
                    for e in recent) or "<tr><td colspan=4 class=muted>no events yet</td></tr>"
     body = f"""<h1>Dashboard</h1>
@@ -199,7 +205,7 @@ def events():
     evs = c.execute("""SELECT e.*, s.idx AS snap FROM events e LEFT JOIN snapshots s ON s.idx=e.idx
                        WHERE e.ts>=? ORDER BY e.idx DESC LIMIT 500""", (since,)).fetchall()
     cam = lambda e: (f"<a href='{url_for('snapshot', idx=e['idx'])}' target=_blank title='camera snapshot'>&#128247;</a>" if e['snap'] else "")
-    rows = "".join(f"<tr><td>{e['idx']}</td><td>{h(e['ts'])}</td><td>{h(e['card'])}</td><td>{door_name(e['door'])}</td>"
+    rows = "".join(f"<tr><td>{e['idx']}</td><td>{h(e['ts'])}</td><td>{card_label(e['card'])}</td><td>{door_name(e['door'])}</td>"
                    f"<td class='{'g' if e['granted'] else 'r'}'>{'granted' if e['granted'] else 'denied'}</td>"
                    f"<td>{h(e['event_type'])}</td><td>{cam(e)}</td></tr>" for e in evs) or "<tr><td colspan=7 class=muted>none</td></tr>"
     body = f"""<h1>Events</h1>
@@ -212,7 +218,7 @@ def events():
 @app.route("/attendance")
 def attendance():
     c = db(); days = parse_days()
-    rows = "".join(f"<tr><td>{h(r['date'])}</td><td>{h(r['card'])}</td><td>{h(r['first_seen'])}</td>"
+    rows = "".join(f"<tr><td>{h(r['date'])}</td><td>{card_label(r['card'])}</td><td>{h(r['first_seen'])}</td>"
                    f"<td>{h(r['last_seen'])}</td><td>{r['events']}</td><td>{r['granted']}</td></tr>"
                    for r in pdb.attendance(c, days)) or "<tr><td colspan=6 class=muted>none</td></tr>"
     body = f"""<h1>Attendance</h1>
@@ -372,19 +378,16 @@ def camera_test(cid):
     return "snapshot failed — check IP / credentials / channel", 502
 
 
-@app.route("/settings", methods=["GET", "POST"])
+@app.route("/settings")
 def settings():
-    c = db()
-    if request.method == "POST":
-        for n in (1, 2, 3, 4):
-            c.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                      (f"door{n}", request.form.get(f"door{n}", "").strip()[:40]))
-        c.commit(); return redirect(url_for("settings"))
-    inputs = "".join(f"<div><label>Door {n} name</label><input name=door{n} maxlength=40 value=\"{door_name(n)}\"></div>" for n in (1, 2, 3, 4))
+    db()
+    rows = "".join(f"<tr><td>Door {n}</td><td>{door_name(n)}</td></tr>" for n in (1, 2, 3, 4))
     body = f"""<h1>Settings</h1>
     <div class=card><h2>Door names</h2>
-      <form class=row method=post>{inputs}<button>Save</button></form>
-      <p class=muted>Names appear across Events, Attendance, Patrol and Meetings.</p></div>
+      <table><tr><th>Position</th><th>Name</th></tr>{rows}</table>
+      <p class=muted>Door names are read live from the Access UI's store, so Ops always matches it.
+      Rename a door in the <a href="/" style="color:var(--brass)">Access UI</a> (Doors) and it updates
+      everywhere here — Events, Attendance, Patrol and Meetings — automatically.</p></div>
     <div class=card><h2>Listener guard (anti phone-home)</h2>
       <p class=muted>Controlled by the door-control service on :8082 — <code>/guard/on</code>, <code>/guard/off</code>, <code>/guard/enforce</code> (Bearer token). Currently enforced to this host.</p></div>"""
     return page("settings", "Settings", body)
@@ -400,10 +403,24 @@ def controllers():
             except Exception:
                 pass
         return redirect(url_for("controllers"))
-    cfg = pdb.configured_controllers(CONF)
+    cfg = pdb.configured_controllers(CONF)                 # daemon config (REST/CLI/collector/guard)
+    ui  = {c["serial"]: c for c in pdb.httpd_controllers() if c["serial"]}  # Access UI store (authoritative names)
+    dmap = {c["serial"]: pdb.door_names(c["serial"]) for c in ui.values()}
+    crows = ""
+    for s in sorted(set(cfg) | set(ui)):
+        c = ui.get(s, {})
+        name = c.get("name") or "<span class=muted>(unnamed)</span>"
+        ip = c.get("address") or cfg.get(s, "")
+        doors = dmap.get(s) or {}
+        dtxt = ", ".join(f"{n}:{escape(doors[n])}" for n in (1, 2, 3, 4) if doors.get(n, "").strip()
+                         and not doors[n].startswith("Door ")) or "<span class=muted>—</span>"
+        flags = []
+        flags.append("<span class=g>Access&nbsp;UI</span>" if s in ui else "<span class=r>not in Access&nbsp;UI</span>")
+        flags.append("<span class=g>daemons</span>" if s in cfg else "<span class=r>not in config</span>")
+        crows += (f"<tr><td>{name}</td><td>{escape(s)}</td><td>{escape(ip)}</td>"
+                  f"<td>{dtxt}</td><td>{' · '.join(flags)}</td></tr>")
+    crows = crows or "<tr><td colspan=5 class=muted>none</td></tr>"
     disc = pdb.discover(CONF) if request.args.get("discover") else None
-    crows = "".join(f"<tr><td>{escape(s)}</td><td>{escape(ip)}</td><td class=g>configured</td></tr>"
-                    for s, ip in cfg.items()) or "<tr><td colspan=3 class=muted>none</td></tr>"
     disc_html = "<p class=muted>Click to broadcast-scan the LAN for UHPPOTE controllers.</p>"
     if disc is not None:
         drows = ""
@@ -420,13 +437,17 @@ def controllers():
         disc_html = ("<table><tr><th>Serial</th><th>IP</th><th>Version</th><th>MAC</th>"
                      "<th>Status</th><th></th></tr>" + drows + "</table>")
     body = f"""<h1>Controllers</h1>
-    <div class=card><h2>Configured</h2>
-      <table><tr><th>Serial</th><th>IP</th><th>Status</th></tr>{crows}</table></div>
+    <div class=card><h2>Known controllers</h2>
+      <table><tr><th>Name</th><th>Serial</th><th>IP</th><th>Named doors</th><th>Registered in</th></tr>{crows}</table>
+      <p class=muted>Names and door assignments come from the Access UI store (the single source of truth).
+      &ldquo;daemons&rdquo; means it is in the service config that the REST API, collector and guard use;
+      &ldquo;Access&nbsp;UI&rdquo; means it is managed in the main UI. A controller should be in both.</p></div>
     <div class=card><h2>Network discovery</h2>
       <form method=get><input type=hidden name=discover value=1><button>Discover on network</button></form>
       {disc_html}
-      <p class=muted>Adding a controller appends it to the config and reloads the web UI + REST; it gets
-      generic door names you can rename afterward.</p></div>"""
+      <p class=muted>Adding a controller here appends it to the service config and reloads the REST API; add it
+      in the <a href="/" style="color:var(--brass)">Access UI</a> too so it appears in the main UI with
+      editable doors and cards.</p></div>"""
     return page("controllers", "Controllers", body)
 
 

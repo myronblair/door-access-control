@@ -6,9 +6,13 @@ tables and the report logic live in exactly one place.
 
 Copyright (c) 2026 TomTom Enterprises.
 """
-import os, re, sqlite3, subprocess, datetime
+import os, re, sqlite3, subprocess, datetime, json
 
 DB = os.environ.get("PORTCULLIS_DB", "/var/lib/portcullis/portcullis.db")
+
+# uhppoted-httpd keeps its own authoritative stores here; the main web UI reads door/controller/card
+# names from these files, so Portcullis reads the same ones rather than keeping a divergent copy.
+HTTPD_SYS = os.environ.get("PORTCULLIS_HTTPD_SYS", "/var/uhppoted/httpd/system")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(idx INTEGER PRIMARY KEY, ts TEXT, card TEXT, door INTEGER,
@@ -87,6 +91,50 @@ def discover(conf):
                           "mac": p[4] if len(p) > 4 else "", "version": p[5] if len(p) > 5 else "",
                           "date": p[6] if len(p) > 6 else ""})
     return found
+
+
+def _httpd_json(name):
+    """Load one uhppoted-httpd system store (doors.json/controllers.json/cards.json), or {} if
+    unreadable. These are the names the main Access UI shows — the single source of truth."""
+    try:
+        with open(os.path.join(HTTPD_SYS, name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def httpd_controllers():
+    """Controllers as the Access UI knows them: dicts {serial, name, address, doors{pos:door-OID}}."""
+    out = []
+    for c in _httpd_json("controllers.json").get("controllers", []):
+        out.append({"serial": str(c.get("device-id") or ""), "name": (c.get("name") or "").strip(),
+                    "address": c.get("address") or "", "doors": c.get("doors") or {}})
+    return out
+
+
+def _door_oid_names():
+    return {d.get("OID"): (d.get("name") or "").strip()
+            for d in _httpd_json("doors.json").get("doors", []) if d.get("OID")}
+
+
+def door_names(serial=None):
+    """{1..4: name} for a controller, resolved through the httpd store so names match the main UI.
+    Positions with no door record fall back to 'Door N'. serial=None picks the first controller that
+    has a device address (the real panel)."""
+    oid_names, ctrls = _door_oid_names(), httpd_controllers()
+    chosen = None
+    if serial:
+        chosen = next((c for c in ctrls if c["serial"] == str(serial)), None)
+    if chosen is None:
+        chosen = next((c for c in ctrls if c["address"]), None) or (ctrls[0] if ctrls else {})
+    doors = chosen.get("doors", {}) if chosen else {}
+    return {n: (oid_names.get(doors.get(str(n), ""), "") or f"Door {n}") for n in (1, 2, 3, 4)}
+
+
+def card_names():
+    """card-number (as text) -> holder name, from the Access UI's card store."""
+    return {str(c.get("card")): (c.get("name") or "").strip()
+            for c in _httpd_json("cards.json").get("cards", []) if c.get("card")}
 
 
 def attendance(con, days=30):
