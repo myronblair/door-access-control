@@ -36,3 +36,24 @@ footer{color:var(--footer-text-colour);background:var(--footer-background-colour
 ::-webkit-scrollbar{width:12px;height:12px}
 ::-webkit-scrollbar-thumb{background:#2a3542;border-radius:8px;border:2px solid #0f141b}
 ::-webkit-scrollbar-track{background:#0b0f14}
+
+/* ===== Portcullis consistency — match the Ops look (typography, nav, tables) ===== */
+:root{--pc-bg:#0f141b;--pc-panel:#161d27;--pc-line:#2a3542;--pc-brass:#e0b23b;--pc-text:#e6edf3;--pc-muted:#8b98a5}
+body,input,select,textarea,button,table,th,td,h1,h2,h3,legend,nav,.title,.tabular{
+  font-family:'Lato',system-ui,-apple-system,sans-serif !important}
+body{font-size:15px;line-height:1.5;color:var(--pc-text)}
+/* nav as Ops pills */
+nav ul{display:flex;flex-wrap:wrap;gap:4px;list-style:none;margin:0;padding:10px 16px;background:#0b0f14;border-bottom:1px solid var(--pc-line)}
+nav li{list-style:none}
+nav li a,nav li.selected{display:block;padding:7px 13px;border-radius:8px;font-weight:700;font-size:13px;letter-spacing:.3px;text-decoration:none}
+nav li a{color:var(--pc-muted)}
+nav li a:hover{color:var(--pc-text);background:#161d27}
+nav li.selected{color:#0f141b;background:var(--pc-brass);font-weight:800}
+/* tables to match Ops */
+main table,.tabular table{background:var(--pc-panel);border:1px solid var(--pc-line);border-radius:10px;border-collapse:separate;border-spacing:0;overflow:hidden}
+thead th,th.colheader,th.topleft{background:#1b2531 !important;color:var(--pc-brass) !important;
+  text-transform:uppercase;letter-spacing:.4px;font-size:12px !important;font-weight:800 !important}
+tbody td{font-size:14px;border-bottom:1px solid var(--pc-line)}
+/* legends / titles in brass */
+legend,.title,h1,h2,h3{color:var(--pc-brass)}
+legend{font-weight:800;letter-spacing:.5px;text-transform:uppercase}
