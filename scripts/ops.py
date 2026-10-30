@@ -205,6 +205,7 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:3px}
 input,select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
 button{background:var(--brass);color:#0f141b;border:none;border-radius:8px;padding:9px 16px;font-weight:800;cursor:pointer}
 button.del{background:#3a1f22;color:#e5484d;padding:5px 10px;font-weight:700}
+.editlink{color:var(--brass);text-decoration:none;margin-right:10px;font-weight:700}.editlink:hover{text-decoration:underline}
 .tiles{display:flex;flex-wrap:wrap;gap:14px}.tile{flex:1;min-width:150px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
 .tile .n{font-size:30px;font-weight:800;color:var(--brass)}.tile .l{color:var(--muted);font-size:13px}
 .muted{color:var(--muted)}.err{background:#3a1f22;color:#ff8a8e;border-radius:8px;padding:9px 12px}
@@ -218,7 +219,8 @@ button.del{background:#3a1f22;color:#e5484d;padding:5px 10px;font-weight:700}
 
 PAGES = [("dashboard", "Dashboard"), ("events", "Events"), ("attendance", "Attendance"),
          ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"),
-         ("devices", "Devices"), ("controllers", "Controllers"), ("sync", "Sync"), ("settings", "Settings")]
+         ("devices", "Devices"), ("controllers", "Controllers"), ("sync", "Sync"),
+         ("logs", "Logs"), ("settings", "Settings")]
 
 
 def sync_badge():
@@ -249,6 +251,19 @@ def delete_form(field, ident):
             f"<button class=del>delete</button></form>")
 
 
+def edit_link(param, ident):
+    return f"<a class=editlink href='?{param}={int(ident)}'>edit</a>"
+
+
+def row_actions(param, delfield, ident):
+    return f"<td style=white-space:nowrap>{edit_link(param, ident)}{delete_form(delfield, ident)}</td>"
+
+
+def sel_doors(selected):
+    """<option> list for doors 1-4 with one preselected (0 = none)."""
+    return "".join(f"<option value={n}{' selected' if selected == n else ''}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
+
+
 @app.route("/")
 def dashboard():
     c = db()
@@ -269,9 +284,27 @@ def dashboard():
     return page("dashboard", "Dashboard", body)
 
 
-@app.route("/events")
+@app.route("/events", methods=["GET", "POST"])
 def events():
     c = db(); days = parse_days()
+    if request.method == "POST":
+        if request.form.get("clear") != "yes":
+            return bad("events", "Tick confirm to clear all events.")
+        order = (meta_get(c, "ctrl_order", "") or "").split(",")
+        for (serial,) in c.execute("SELECT DISTINCT controller FROM events WHERE controller IS NOT NULL").fetchall():
+            pos = order.index(serial) * STRIDE if serial in order else 0
+            base = pos + int(meta_get(c, f"off_{serial}", "0"))
+            nmax = c.execute("SELECT MAX(idx) FROM events WHERE controller=?", (serial,)).fetchone()[0]
+            if nmax is not None:                      # don't re-collect the cleared history on the next poll
+                meta_set(c, f"floor_{serial}", nmax - base)
+        for (p,) in c.execute("SELECT path FROM snapshots WHERE path IS NOT NULL").fetchall():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        c.execute("DELETE FROM snapshots"); c.execute("DELETE FROM events")
+        c.commit(); audit("clear events", "all")
+        return redirect(url_for("events"))
     since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     evs = c.execute("""SELECT e.*, s.idx AS snap FROM events e LEFT JOIN snapshots s ON s.idx=e.idx
                        WHERE e.ts>=? ORDER BY e.idx DESC LIMIT 500""", (since,)).fetchall()
@@ -286,8 +319,14 @@ def events():
            or f"<tr><td colspan={8 if multi else 7} class=muted>none</td></tr>"
     cth = "<th>Controller</th>" if multi else ""
     body = f"""<h1>Events</h1>
-    <form class=row method=get><div><label>show last (days)</label><input name=days value="{days}" size=5></div><button>Filter</button></form>
-    <p class=muted>{len(evs)} events (most recent 500)</p>
+    <div style='display:flex;gap:10px;align-items:end;flex-wrap:wrap'>
+      <form class=row method=get><div><label>show last (days)</label><input name=days value="{days}" size=5></div><button>Filter</button></form>
+      <form class=row method=post style='margin-left:auto'>
+        <label style='display:inline;margin:0 6px 0 0'><input type=checkbox name=clear value=yes> confirm</label>
+        <button class=del>Clear all events</button></form>
+    </div>
+    <p class=muted>{len(evs)} events (most recent 500). Clearing wipes the stored history + snapshots here; it does not
+    touch the panel, and already-recorded events won't be re-collected.</p>
     <table><tr><th>#</th><th>Time</th>{cth}<th>Card</th><th>Door</th><th>Result</th><th>Type</th><th>Cam</th></tr>{rows}</table>"""
     return page("events", "Events", body)
 
@@ -313,7 +352,11 @@ def patrol():
             name = f.get("name", "").strip()
             if not name or not valid_door(f.get("door")):
                 return bad("patrol", "Checkpoint needs a name and a door 1-4.")
-            c.execute("INSERT INTO patrol_points(name,door) VALUES(?,?)", (name, int(f["door"])))
+            if f.get("id", "").isdigit():
+                c.execute("UPDATE patrol_points SET name=?,door=? WHERE id=?", (name, int(f["door"]), f["id"]))
+                audit("edit checkpoint", f"{f['id']} {name}")
+            else:
+                c.execute("INSERT INTO patrol_points(name,door) VALUES(?,?)", (name, int(f["door"]))); audit("add checkpoint", name)
         elif f.get("add") == "route":
             name, doors = f.get("name", "").strip(), parse_doors(f.get("doors"))
             if not name or not doors:
@@ -321,19 +364,25 @@ def patrol():
             for k in ("win_start", "win_end"):
                 if f.get(k, "").strip() and norm_hhmm(f[k], None) is None:
                     return bad("patrol", "Times must look like 22:00 (HH:MM).")
-            c.execute("INSERT INTO patrol_routes(name,doors,win_start,win_end) VALUES(?,?,?,?)",
-                      (name, ",".join(map(str, doors)), norm_hhmm(f.get("win_start"), "00:00"),
-                       norm_hhmm(f.get("win_end"), "23:59")))
+            vals = (name, ",".join(map(str, doors)), norm_hhmm(f.get("win_start"), "00:00"), norm_hhmm(f.get("win_end"), "23:59"))
+            if f.get("id", "").isdigit():
+                c.execute("UPDATE patrol_routes SET name=?,doors=?,win_start=?,win_end=? WHERE id=?", (*vals, f["id"]))
+                audit("edit route", f"{f['id']} {name}")
+            else:
+                c.execute("INSERT INTO patrol_routes(name,doors,win_start,win_end) VALUES(?,?,?,?)", vals); audit("add route", name)
         elif f.get("del_point", "").isdigit():
-            c.execute("DELETE FROM patrol_points WHERE id=?", (f["del_point"],))
+            c.execute("DELETE FROM patrol_points WHERE id=?", (f["del_point"],)); audit("delete checkpoint", f["del_point"])
         elif f.get("del_route", "").isdigit():
-            c.execute("DELETE FROM patrol_routes WHERE id=?", (f["del_route"],))
+            c.execute("DELETE FROM patrol_routes WHERE id=?", (f["del_route"],)); audit("delete route", f["del_route"])
         c.commit()
         return redirect(url_for("patrol"))
+    ep = c.execute("SELECT * FROM patrol_points WHERE id=?", (request.args.get("edit_point"),)).fetchone() \
+        if request.args.get("edit_point", "").isdigit() else None
+    er = c.execute("SELECT * FROM patrol_routes WHERE id=?", (request.args.get("edit_route"),)).fetchone() \
+        if request.args.get("edit_route", "").isdigit() else None
     pts = c.execute("SELECT * FROM patrol_points ORDER BY name").fetchall()
     rts = c.execute("SELECT * FROM patrol_routes ORDER BY name").fetchall()
-    dsel = "".join(f"<option value={n}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
-    prows = "".join(f"<tr><td>{h(p['name'])}</td><td>{door_name(p['door'])}</td><td>{delete_form('del_point', p['id'])}</td></tr>"
+    prows = "".join(f"<tr><td>{h(p['name'])}</td><td>{door_name(p['door'])}</td>{row_actions('edit_point', 'del_point', p['id'])}</tr>"
                     for p in pts) or "<tr><td colspan=3 class=muted>no checkpoints</td></tr>"
     now = datetime.datetime.now()
     rrows = ""
@@ -344,19 +393,25 @@ def patrol():
             n = c.execute("SELECT COUNT(*) n FROM events WHERE door=? AND ts>=? AND ts<=?", (d, a, b)).fetchone()["n"]
             hits.append(f"<span class='{'g' if n else 'r'}'>{door_name(d)}{'✓' if n else '✗'}</span>")
         rrows += (f"<tr><td>{h(r['name'])}</td><td>{h(norm_hhmm(r['win_start'], '00:00'))}–{h(norm_hhmm(r['win_end'], '23:59'))}</td>"
-                  f"<td>{' '.join(hits) or '<span class=muted>no valid doors</span>'}</td><td>{delete_form('del_route', r['id'])}</td></tr>")
+                  f"<td>{' '.join(hits) or '<span class=muted>no valid doors</span>'}</td>{row_actions('edit_route', 'del_route', r['id'])}</tr>")
     rrows = rrows or "<tr><td colspan=4 class=muted>no routes</td></tr>"
+    pid = f"<input type=hidden name=id value={ep['id']}>" if ep else ""
+    rid = f"<input type=hidden name=id value={er['id']}>" if er else ""
+    pcancel = f" <a href='{url_for('patrol')}' style='align-self:center;color:var(--muted)'>cancel</a>" if ep else ""
+    rcancel = f" <a href='{url_for('patrol')}' style='align-self:center;color:var(--muted)'>cancel</a>" if er else ""
     body = f"""<h1>Patrol</h1>
     <div class=card><h2>Checkpoints</h2><table><tr><th>Name</th><th>Reader/Door</th><th></th></tr>{prows}</table>
-      <form class=row method=post><input type=hidden name=add value=point>
-        <div><label>name</label><input name=name required></div>
-        <div><label>door</label><select name=door>{dsel}</select></div><button>Add checkpoint</button></form></div>
+      <form class=row method=post><input type=hidden name=add value=point>{pid}
+        <div><label>name</label><input name=name required value="{h(ep['name']) if ep else ''}"></div>
+        <div><label>door</label><select name=door>{sel_doors(ep['door'] if ep else 0)}</select></div>
+        <button>{'Save checkpoint' if ep else 'Add checkpoint'}</button>{pcancel}</form></div>
     <div class=card><h2>Routes (status for the current run)</h2><table><tr><th>Route</th><th>Window</th><th>Checkpoints hit</th><th></th></tr>{rrows}</table>
-      <form class=row method=post><input type=hidden name=add value=route>
-        <div><label>name</label><input name=name required></div>
-        <div><label>doors (csv e.g. 1,2)</label><input name=doors placeholder="1,2"></div>
-        <div><label>from</label><input name=win_start placeholder="22:00" size=6></div>
-        <div><label>to</label><input name=win_end placeholder="06:00" size=6></div><button>Add route</button></form>
+      <form class=row method=post><input type=hidden name=add value=route>{rid}
+        <div><label>name</label><input name=name required value="{h(er['name']) if er else ''}"></div>
+        <div><label>doors (csv e.g. 1,2)</label><input name=doors placeholder="1,2" value="{h(er['doors']) if er else ''}"></div>
+        <div><label>from</label><input name=win_start placeholder="22:00" size=6 value="{h(er['win_start']) if er else ''}"></div>
+        <div><label>to</label><input name=win_end placeholder="06:00" size=6 value="{h(er['win_end']) if er else ''}"></div>
+        <button>{'Save route' if er else 'Add route'}</button>{rcancel}</form>
       <p class=muted>A window that ends before it starts (22:00 &ndash; 06:00) runs overnight.</p></div>"""
     return page("patrol", "Patrol", body)
 
@@ -367,29 +422,38 @@ def meetings():
     if request.method == "POST":
         f = request.form
         if f.get("del", "").isdigit():
-            c.execute("DELETE FROM meetings WHERE id=?", (f["del"],))
+            c.execute("DELETE FROM meetings WHERE id=?", (f["del"],)); audit("delete meeting", f["del"])
+            c.commit(); return redirect(url_for("meetings"))
+        name, start, end = f.get("name", "").strip(), norm_ts(f.get("start_ts")), norm_ts(f.get("end_ts"))
+        if not name or not valid_door(f.get("door")) or not start or not end or end < start:
+            return bad("meetings", "Meeting needs a name, a door, and start/end like 2026-10-30 09:00 (end after start).")
+        if f.get("id", "").isdigit():
+            c.execute("UPDATE meetings SET name=?,door=?,start_ts=?,end_ts=? WHERE id=?",
+                      (name, int(f["door"]), start, end, f["id"])); audit("edit meeting", f"{f['id']} {name}")
         else:
-            name, start, end = f.get("name", "").strip(), norm_ts(f.get("start_ts")), norm_ts(f.get("end_ts"))
-            if not name or not valid_door(f.get("door")) or not start or not end or end < start:
-                return bad("meetings", "Meeting needs a name, a door, and start/end like 2026-10-30 09:00 (end after start).")
             c.execute("INSERT INTO meetings(name,door,start_ts,end_ts) VALUES(?,?,?,?)", (name, int(f["door"]), start, end))
+            audit("add meeting", name)
         c.commit(); return redirect(url_for("meetings"))
+    ed = c.execute("SELECT * FROM meetings WHERE id=?", (request.args.get("edit"),)).fetchone() \
+        if request.args.get("edit", "").isdigit() else None
     ms = c.execute("SELECT * FROM meetings ORDER BY start_ts DESC").fetchall()
-    dsel = "".join(f"<option value={n}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
     rows = ""
     for m in ms:
         att = c.execute("SELECT COUNT(DISTINCT card) n FROM events WHERE door=? AND ts>=? AND ts<=? AND granted=1",
                         (m["door"], m["start_ts"], m["end_ts"])).fetchone()["n"]
         rows += (f"<tr><td>{h(m['name'])}</td><td>{door_name(m['door'])}</td><td>{h(m['start_ts'])}</td><td>{h(m['end_ts'])}</td>"
-                 f"<td class=g>{att} signed in</td><td>{delete_form('del', m['id'])}</td></tr>")
+                 f"<td class=g>{att} signed in</td>{row_actions('edit', 'del', m['id'])}</tr>")
     rows = rows or "<tr><td colspan=6 class=muted>no meetings</td></tr>"
+    eid = f"<input type=hidden name=id value={ed['id']}>" if ed else ""
+    cancel = f" <a href='{url_for('meetings')}' style='align-self:center;color:var(--muted)'>cancel</a>" if ed else ""
     body = f"""<h1>Meetings</h1>
     <table><tr><th>Name</th><th>Reader</th><th>Start</th><th>End</th><th>Attendance</th><th></th></tr>{rows}</table>
-    <div class=card><h2>Add meeting</h2><form class=row method=post>
-      <div><label>name</label><input name=name required></div>
-      <div><label>reader/door</label><select name=door>{dsel}</select></div>
-      <div><label>start (YYYY-MM-DD HH:MM)</label><input name=start_ts size=20 required></div>
-      <div><label>end</label><input name=end_ts size=20 required></div><button>Add</button></form>
+    <div class=card><h2>{'Edit' if ed else 'Add'} meeting</h2><form class=row method=post>{eid}
+      <div><label>name</label><input name=name required value="{h(ed['name']) if ed else ''}"></div>
+      <div><label>reader/door</label><select name=door>{sel_doors(ed['door'] if ed else 0)}</select></div>
+      <div><label>start (YYYY-MM-DD HH:MM)</label><input name=start_ts size=20 required value="{h(ed['start_ts']) if ed else ''}"></div>
+      <div><label>end</label><input name=end_ts size=20 required value="{h(ed['end_ts']) if ed else ''}"></div>
+      <button>{'Save' if ed else 'Add'}</button>{cancel}</form>
       <p class=muted>Attendance = distinct cards granted at that reader within the window.</p></div>"""
     return page("meetings", "Meetings", body)
 
@@ -400,36 +464,49 @@ def cameras():
     if request.method == "POST":
         f = request.form
         if f.get("del", "").isdigit():
-            c.execute("DELETE FROM cameras WHERE id=?", (f["del"],))
+            c.execute("DELETE FROM cameras WHERE id=?", (f["del"],)); audit("delete camera", f["del"])
+            c.commit(); return redirect(url_for("cameras"))
+        name, ip, ch = f.get("name", "").strip(), f.get("ip", "").strip(), f.get("channel", "").strip() or "101"
+        if not name or not pdb.valid_host(ip) or not ch.isdigit() or not valid_door(f.get("door")):
+            return bad("cameras", "Camera needs a name, a valid IP/hostname, a numeric channel and a door.")
+        user, rtsp = f.get("username", "").strip() or "admin", f.get("rtsp", "").strip()
+        if f.get("id", "").isdigit():
+            if f.get("password", ""):                     # only overwrite the password when a new one is typed
+                c.execute("UPDATE cameras SET name=?,ip=?,username=?,password=?,door=?,channel=?,rtsp=? WHERE id=?",
+                          (name, ip, user, f["password"], int(f["door"]), ch, rtsp, f["id"]))
+            else:
+                c.execute("UPDATE cameras SET name=?,ip=?,username=?,door=?,channel=?,rtsp=? WHERE id=?",
+                          (name, ip, user, int(f["door"]), ch, rtsp, f["id"]))
+            audit("edit camera", f"{f['id']} {name}")
         else:
-            name, ip, ch = f.get("name", "").strip(), f.get("ip", "").strip(), f.get("channel", "").strip() or "101"
-            if not name or not pdb.valid_host(ip) or not ch.isdigit() or not valid_door(f.get("door")):
-                return bad("cameras", "Camera needs a name, a valid IP/hostname, a numeric channel and a door.")
             c.execute("INSERT INTO cameras(name,ip,username,password,door,channel,rtsp) VALUES(?,?,?,?,?,?,?)",
-                      (name, ip, f.get("username", "").strip() or "admin", f.get("password", ""),
-                       int(f["door"]), ch, f.get("rtsp", "").strip()))
+                      (name, ip, user, f.get("password", ""), int(f["door"]), ch, rtsp))
+            audit("add camera", name)
         c.commit(); return redirect(url_for("cameras"))
+    ed = c.execute("SELECT * FROM cameras WHERE id=?", (request.args.get("edit"),)).fetchone() \
+        if request.args.get("edit", "").isdigit() else None
     cams = c.execute("SELECT * FROM cameras ORDER BY name").fetchall()
-    dsel = "".join(f"<option value={n}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
     rows = "".join(
         f"<tr><td>{h(m['name'])}</td><td>{h(m['ip'])}</td><td>{h(m['username'])}</td>"
         f"<td>{'&#9679; set' if m['password'] else '&mdash;'}</td><td>{h(m['channel'] or '101')}</td>"
         f"<td>{door_name(m['door'])}</td>"
         f"<td><form method=post action='{url_for('camera_test', cid=m['id'])}' target=_blank style=display:inline>"
         f"<button class=del>test</button></form></td>"
-        f"<td>{delete_form('del', m['id'])}</td></tr>" for m in cams) or "<tr><td colspan=8 class=muted>no cameras</td></tr>"
+        f"{row_actions('edit', 'del', m['id'])}</tr>" for m in cams) or "<tr><td colspan=8 class=muted>no cameras</td></tr>"
+    eid = f"<input type=hidden name=id value={ed['id']}>" if ed else ""
+    cancel = f" <a href='{url_for('cameras')}' style='align-self:center;color:var(--muted)'>cancel</a>" if ed else ""
     body = f"""<h1>Cameras</h1>
     <p class=muted>Hikvision ISAPI. A camera linked to a door gets an auto-snapshot when that door fires an event (shown on the Events page with &#128247;). Snapshots are kept for 30 days.</p>
     <table><tr><th>Name</th><th>IP</th><th>User</th><th>Pass</th><th>Ch</th><th>Door</th><th>Test</th><th></th></tr>{rows}</table>
-    <div class=card><h2>Add camera</h2><form class=row method=post>
-      <div><label>name</label><input name=name required></div>
-      <div><label>IP</label><input name=ip placeholder="10.48.200.x" required></div>
-      <div><label>username</label><input name=username value="admin"></div>
-      <div><label>password</label><input name=password type=password></div>
-      <div><label>channel</label><input name=channel value="101" size=5></div>
-      <div><label>door</label><select name=door>{dsel}</select></div>
-      <div><label>RTSP path (optional)</label><input name=rtsp placeholder="/Streaming/Channels/101"></div>
-      <button>Add</button></form>
+    <div class=card><h2>{'Edit' if ed else 'Add'} camera</h2><form class=row method=post>{eid}
+      <div><label>name</label><input name=name required value="{h(ed['name']) if ed else ''}"></div>
+      <div><label>IP</label><input name=ip placeholder="10.48.200.x" required value="{h(ed['ip']) if ed else ''}"></div>
+      <div><label>username</label><input name=username value="{h(ed['username']) if ed else 'admin'}"></div>
+      <div><label>password</label><input name=password type=password placeholder="{'(unchanged)' if ed else ''}"></div>
+      <div><label>channel</label><input name=channel size=5 value="{h(ed['channel'] or '101') if ed else '101'}"></div>
+      <div><label>door</label><select name=door>{sel_doors(ed['door'] if ed else 0)}</select></div>
+      <div><label>RTSP path (optional)</label><input name=rtsp placeholder="/Streaming/Channels/101" value="{h(ed['rtsp']) if ed else ''}"></div>
+      <button>{'Save' if ed else 'Add'}</button>{cancel}</form>
       <p class=muted>Snapshot URL: http://&lt;ip&gt;/ISAPI/Streaming/channels/&lt;ch&gt;/picture (digest auth). Click &ldquo;test&rdquo; after adding to verify the credentials.</p></div>"""
     return page("cameras", "Cameras", body)
 
@@ -453,6 +530,51 @@ def camera_test(cid):
     if jpg:
         return app.response_class(jpg, mimetype="image/jpeg")
     return "snapshot failed — check IP / credentials / channel", 502
+
+
+@app.route("/logs", methods=["GET", "POST"])
+def logs():
+    c = db()
+    if request.method == "POST":
+        w = request.form.get("clear")
+        if w == "ops":
+            c.execute("DELETE FROM ops_log"); c.commit(); audit("clear ops log", "")
+        elif w == "guard":
+            try:
+                open("/var/log/portcullis/guard.log", "w").close()
+            except OSError:
+                pass
+            audit("clear guard log", "")
+        elif w == "audit":
+            pdb._write_store("logs.json", {"logs": []})
+            subprocess.run(["sudo", "/usr/local/sbin/portcullis-reload-httpd"], timeout=40)
+            audit("clear audit log", "")
+        return redirect(url_for("logs"))
+    ol = c.execute("SELECT * FROM ops_log ORDER BY id DESC LIMIT 300").fetchall()
+    orows = "".join(f"<tr><td>{h(r['ts'])}</td><td>{h(r['who'])}</td><td>{h(r['action'])}</td>"
+                    f"<td class=muted>{h(r['detail'])}</td></tr>" for r in ol) or "<tr><td colspan=4 class=muted>nothing logged</td></tr>"
+    al = sorted(pdb._httpd_json("logs.json").get("logs", []), key=lambda x: x.get("timestamp", ""), reverse=True)[:300]
+    arows = "".join(f"<tr><td>{h(r.get('timestamp',''))}</td><td>{h(r.get('UID',''))}</td><td>{h(r.get('item',''))}</td>"
+                    f"<td>{h(r.get('field',''))}</td><td class=muted>{h(r.get('details',''))}</td></tr>"
+                    for r in al) or "<tr><td colspan=5 class=muted>no entries</td></tr>"
+    try:
+        gl = open("/var/log/portcullis/guard.log").read().splitlines()[-200:]
+    except OSError:
+        gl = []
+    gtxt = h("\n".join(gl)) or "(empty)"
+    clr = lambda w, lbl: (f"<form method=post style='display:inline;float:right'>"
+                          f"<input type=hidden name=clear value={w}><button class=del>{lbl}</button></form>")
+    body = f"""<h1>Logs</h1>
+    <div class=card><h2>Ops actions{clr('ops','clear all')}</h2>
+      <p class=muted>Every add / edit / delete / sync / door-open done in this Ops panel.</p>
+      <table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>{orows}</table></div>
+    <div class=card><h2>Access UI audit log{clr('audit','clear all')}</h2>
+      <p class=muted>Changes made in the main Access UI (controllers, doors, cards, users).</p>
+      <table><tr><th>When</th><th>User</th><th>Item</th><th>Field</th><th>Detail</th></tr>{arows}</table></div>
+    <div class=card><h2>Guard service log{clr('guard','clear')}</h2>
+      <p class=muted>The listener guard's drift/revert log (anti phone-home). Other service logs live in journald.</p>
+      <pre style='white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;max-height:340px;overflow:auto;font-size:12px'>{gtxt}</pre></div>"""
+    return page("logs", "Logs", body)
 
 
 @app.route("/settings")
@@ -600,14 +722,14 @@ def devices():
     if request.method == "POST":
         f = request.form
         if f.get("del", "").isdigit():
-            c.execute("DELETE FROM peripherals WHERE id=?", (f["del"],))
+            c.execute("DELETE FROM peripherals WHERE id=?", (f["del"],)); audit("delete device", f["del"])
             c.commit(); return redirect(url_for("devices"))
         if f.get("addcam", "").strip():                      # promote a discovered camera to the Cameras page
             ip = f.get("addcam", "").strip()
             if pdb.valid_host(ip):
                 c.execute("INSERT INTO cameras(name,ip,username,password,door,channel,rtsp) VALUES(?,?,?,?,?,?,?)",
                           (ip, ip, "admin", "", 1, "101", ""))
-                c.commit()
+                c.commit(); audit("add camera (ONVIF)", ip)
             return redirect(url_for("cameras", err="Camera added with defaults — set its password and door on this page."))
         kind = f.get("kind", "").strip().lower()
         name = f.get("name", "").strip()
@@ -622,17 +744,25 @@ def devices():
             return bad("devices", "Controller must be a serial number.")
         if ip and not pdb.valid_host(ip):
             return bad("devices", "IP/host is not valid.")
-        c.execute("INSERT INTO peripherals(kind,controller,door,name,model,ip,notes,created) VALUES(?,?,?,?,?,?,?,?)",
-                  (kind, ctrl, int(door) if door else None, name[:60], f.get("model", "").strip()[:60],
-                   ip, f.get("notes", "").strip()[:200], datetime.datetime.now().isoformat(timespec="seconds")))
+        vals = (kind, ctrl, int(door) if door else None, name[:60], f.get("model", "").strip()[:60],
+                ip, f.get("notes", "").strip()[:200])
+        if f.get("id", "").isdigit():
+            c.execute("UPDATE peripherals SET kind=?,controller=?,door=?,name=?,model=?,ip=?,notes=? WHERE id=?",
+                      (*vals, f["id"])); audit("edit device", f"{f['id']} {name}")
+        else:
+            c.execute("INSERT INTO peripherals(kind,controller,door,name,model,ip,notes,created) VALUES(?,?,?,?,?,?,?,?)",
+                      (*vals, datetime.datetime.now().isoformat(timespec="seconds"))); audit("add device", f"{kind} {name}")
         c.commit(); return redirect(url_for("devices"))
 
     kctrl = known_controllers()
+    ed = c.execute("SELECT * FROM peripherals WHERE id=?", (request.args.get("edit"),)).fetchone() \
+        if request.args.get("edit", "").isdigit() else None
     rows = ""
     # cameras (managed on the Cameras page) — shown here for a complete inventory
     for m in c.execute("SELECT * FROM cameras ORDER BY name"):
         rows += (f"<tr><td>Camera</td><td>{h(m['name'])}</td><td class=muted>—</td><td>{door_name(m['door'])}</td>"
-                 f"<td>{h(m['ip'])}</td><td class=muted>manage on Cameras page</td><td></td></tr>")
+                 f"<td>{h(m['ip'])}</td><td class=muted>manage on Cameras page</td>"
+                 f"<td><a class=editlink href='{url_for('cameras', edit=m['id'])}'>edit</a></td></tr>")
     # keypads — read live from the controller's door flags (Access UI)
     for n in sorted(pdb.door_keypads()):
         rows += (f"<tr><td>Keypad</td><td>{door_name(n)} keypad</td><td class=muted>—</td><td>{door_name(n)}</td>"
@@ -643,13 +773,16 @@ def devices():
         meta = " · ".join(x for x in (h(p["model"]) if p["model"] else "", h(p["ip"]) if p["ip"] else "") if x) or "<span class=muted>—</span>"
         rows += (f"<tr><td>{h(p['kind'].title())}</td><td>{h(p['name'])}</td><td>{loc}</td>"
                  f"<td>{door_name(p['door']) if p['door'] else '<span class=muted>—</span>'}</td>"
-                 f"<td>{meta}</td><td>{h(p['notes'])}</td><td>{delete_form('del', p['id'])}</td></tr>")
+                 f"<td>{meta}</td><td>{h(p['notes'])}</td>{row_actions('edit', 'del', p['id'])}</tr>")
     rows = rows or "<tr><td colspan=7 class=muted>no devices yet</td></tr>"
 
-    ksel = "".join(f"<option value={k}>{k.title()}</option>" for k in pdb.PERIPHERAL_KINDS if k != "keypad")
+    ksel = "".join(f"<option value={k}{' selected' if ed and ed['kind']==k else ''}>{k.title()}</option>"
+                   for k in pdb.PERIPHERAL_KINDS if k != "keypad")
     csel = "<option value=''>— none —</option>" + "".join(
-        f"<option value={escape(s)}>{escape(l)}</option>" for s, l in sorted(kctrl.items()))
-    dsel = "<option value=''>— n/a —</option>" + "".join(f"<option value={n}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
+        f"<option value={escape(s)}{' selected' if ed and ed['controller']==s else ''}>{escape(l)}</option>"
+        for s, l in sorted(kctrl.items()))
+    dsel = "<option value=''>— n/a —</option>" + "".join(
+        f"<option value={n}{' selected' if ed and ed['door']==n else ''}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
 
     disc = pdb.discover_onvif() if request.args.get("discover") else None
     disc_html = "<p class=muted>Scan the LAN for ONVIF/IP cameras. Keypads, locks and closers are wired to the controller and are not network-discoverable — add those below.</p>"
@@ -668,16 +801,18 @@ def devices():
     <table><tr><th>Type</th><th>Name</th><th>Controller</th><th>Door</th><th>Model / IP</th><th>Notes</th><th></th></tr>{rows}</table>
     <div class=card><h2>Discover cameras on the network</h2>
       <form method=get><input type=hidden name=discover value=1><button>Scan for cameras (ONVIF)</button></form>
-      {disc_html}</div>
-    <div class=card><h2>Add item</h2><form class=row method=post>
+      {disc_html}</div>"""
+    eid = f"<input type=hidden name=id value={ed['id']}>" if ed else ""
+    cancel = f" <a href='{url_for('devices')}' style='align-self:center;color:var(--muted)'>cancel</a>" if ed else ""
+    body += f"""<div class=card><h2>{'Edit' if ed else 'Add'} item</h2><form class=row method=post>{eid}
       <div><label>type</label><select name=kind>{ksel}</select></div>
-      <div><label>name</label><input name=name required></div>
+      <div><label>name</label><input name=name required value="{h(ed['name']) if ed else ''}"></div>
       <div><label>controller</label><select name=controller>{csel}</select></div>
       <div><label>door</label><select name=door>{dsel}</select></div>
-      <div><label>make / model</label><input name=model></div>
-      <div><label>IP (optional)</label><input name=ip placeholder="10.48.200.x"></div>
-      <div><label>notes</label><input name=notes></div>
-      <button>Add</button></form>
+      <div><label>make / model</label><input name=model value="{h(ed['model']) if ed else ''}"></div>
+      <div><label>IP (optional)</label><input name=ip placeholder="10.48.200.x" value="{h(ed['ip']) if ed else ''}"></div>
+      <div><label>notes</label><input name=notes value="{h(ed['notes']) if ed else ''}"></div>
+      <button>{'Save' if ed else 'Add'}</button>{cancel}</form>
       <p class=muted>Cameras are added from the scan above (or the Cameras page) so their credentials can be tested;
       keypads come from the Access UI door settings automatically.</p></div>"""
     return page("devices", "Devices", body)
