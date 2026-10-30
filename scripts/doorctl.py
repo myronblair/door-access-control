@@ -69,9 +69,11 @@ def is_foreign(addr):
         return True
 
 
-def enforce():
-    """Set the controller's listener back to this host. Returns (changed, detail)."""
-    cur = get_listener()
+def enforce(cur=None):
+    """Set the controller's listener back to this host. Returns (changed, detail).
+    Pass `cur` to reuse a listener value the caller already fetched (avoids a second round-trip)."""
+    if cur is None:
+        cur = get_listener()
     if cur is None:
         return False, "controller unreachable"
     if cur == SELF_LISTEN:
@@ -108,7 +110,7 @@ def guard_loop():
                 with _lock:
                     _state["last_check"] = datetime.datetime.now().isoformat(timespec="seconds")
                 if cur and cur != SELF_LISTEN:
-                    enforce()
+                    enforce(cur)
             except Exception as e:
                 log(f"guard error: {type(e).__name__}: {e}")
         time.sleep(CHECK_EVERY)
@@ -127,7 +129,7 @@ class H(BaseHTTPRequestHandler):
 
     def _authed(self):
         got, want = self.headers.get("Authorization", ""), "Bearer " + TOKEN
-        return len(got) == len(want) and hmac.compare_digest(got, want)
+        return hmac.compare_digest(got, want)   # compare_digest is already length-safe
 
     def do_GET(self):
         if self.path == "/health":
