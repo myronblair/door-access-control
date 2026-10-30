@@ -59,7 +59,16 @@ survives the controller flapping.
   (moved to :8088 internally), `/ops` → this app. Same Cloudflare Access gate, one login.
   **Pages:** Dashboard · Events · Attendance · Patrol · Meetings · Cameras · **Settings** — each module is
   configured in the UI (no code): patrol checkpoints + routes, meetings, cameras, door names.
-- **Event pipeline** — DONE (`scripts/collector.py`, `portcullis-collector`; events → SQLite).
+- **Ops access control** — every `/ops` request must carry the Cloudflare Access identity header
+  (`PORTCULLIS_OPS_AUTH=access`, default); limit to specific people with `PORTCULLIS_OPS_ALLOW=a@x.com,b@y.com`
+  in `portcullis-ops.service`. POSTs are same-host only (CSRF check) and all stored text is HTML-escaped.
+  The camera password is stored in `portcullis.db` (owner-only, 0600) and passed to curl on stdin, never argv.
+- **Shared code** — `scripts/portcullis_db.py` holds the schema, the attendance query and the camera fetch, used by
+  the collector, the Ops app and `report.py` (installed to `/opt/portcullis/`).
+- **Event pipeline** — DONE (`scripts/collector.py`, `portcullis-collector`; events → SQLite). Polls every 10 s; if the
+  controller's event counter ever goes backwards (reset / replaced panel) stored indices are rebased automatically
+  (`meta.idx_base`). Camera snapshots are taken for fresh events (judged on the controller's clock) and pruned after
+  30 days (`PORTCULLIS_SNAP_KEEP_DAYS`). Patrol windows may run overnight (22:00 → 06:00).
 - **Attendance** — live (per-card/day first/last/counts). CLI too: `report.py [--days N] [--json]`.
 - **Patrol / Meetings** — configurable in the UI (checkpoints/routes with time windows; meetings with a
   reader + window → attendance). Reports computed over the `events` table.

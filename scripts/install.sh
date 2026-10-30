@@ -283,9 +283,10 @@ fi
 if [ -f "$HERE/collector.py" ]; then
   log "installing portcullis-collector (access events -> SQLite)..."
   install -m755 "$HERE/collector.py" "$PORTCULLIS_DIR/collector.py"
+  install -m644 "$HERE/portcullis_db.py" "$PORTCULLIS_DIR/portcullis_db.py"   # shared schema + attendance + camera fetch
   [ -f "$HERE/report.py" ] && install -m755 "$HERE/report.py" "$PORTCULLIS_DIR/report.py"
-  install -d -o "$UHPPOTED_USER" -g "$UHPPOTED_USER" /var/lib/portcullis
-  chown "$UHPPOTED_USER:$UHPPOTED_USER" "$PORTCULLIS_DIR"/collector.py "$PORTCULLIS_DIR"/report.py 2>/dev/null || true
+  install -d -m700 -o "$UHPPOTED_USER" -g "$UHPPOTED_USER" /var/lib/portcullis
+  chown "$UHPPOTED_USER:$UHPPOTED_USER" "$PORTCULLIS_DIR"/collector.py "$PORTCULLIS_DIR"/portcullis_db.py "$PORTCULLIS_DIR"/report.py 2>/dev/null || true
   cat > /etc/systemd/system/portcullis-collector.service <<EOF
 [Unit]
 Description=Portcullis event collector (access events -> SQLite)
@@ -319,10 +320,13 @@ if [ -f "$HERE/ops.py" ]; then
   if [ ! -x "$PORTCULLIS_DIR/venv/bin/python" ]; then
     apt-get install -y -qq python3-venv >/dev/null
     python3 -m venv "$PORTCULLIS_DIR/venv"
-    "$PORTCULLIS_DIR/venv/bin/pip" install -q flask >/dev/null 2>&1
+    "$PORTCULLIS_DIR/venv/bin/pip" install -q flask >/dev/null 2>&1 || true
   fi
+  "$PORTCULLIS_DIR/venv/bin/python" -c 'import flask' 2>/dev/null \
+    || warn "Flask is not importable in $PORTCULLIS_DIR/venv — portcullis-ops will not start (try: $PORTCULLIS_DIR/venv/bin/pip install flask)"
   install -m755 "$HERE/ops.py" "$PORTCULLIS_DIR/ops.py"
-  install -d -o "$UHPPOTED_USER" -g "$UHPPOTED_USER" /var/lib/portcullis
+  install -m644 "$HERE/portcullis_db.py" "$PORTCULLIS_DIR/portcullis_db.py"
+  install -d -m700 -o "$UHPPOTED_USER" -g "$UHPPOTED_USER" /var/lib/portcullis
   chown -R "$UHPPOTED_USER:$UHPPOTED_USER" "$PORTCULLIS_DIR"
   cat > /etc/systemd/system/portcullis-ops.service <<EOF
 [Unit]
@@ -336,6 +340,9 @@ User=$UHPPOTED_USER
 Group=$UHPPOTED_USER
 Environment=PORTCULLIS_OPS_PREFIX=/ops
 Environment=PORTCULLIS_OPS_PORT=8083
+# Ops trusts the Cloudflare Access identity header; restrict to specific emails with PORTCULLIS_OPS_ALLOW=a@x.com,b@y.com
+# (set PORTCULLIS_OPS_AUTH=off only for a LAN-only install with no Cloudflare Access in front)
+Environment=PORTCULLIS_OPS_AUTH=access
 ExecStart=$PORTCULLIS_DIR/venv/bin/python $PORTCULLIS_DIR/ops.py
 Restart=on-failure
 RestartSec=5
@@ -349,7 +356,13 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
   # uhppoted-httpd moves to :8088 (internal); nginx fronts $HTTP_PORT (what the tunnel hits)
-  sed -i 's/^httpd.http.port = .*/httpd.http.port = 8088/' "$ETC_DIR/uhppoted.conf"
+  if grep -q '^httpd.http.port' "$ETC_DIR/uhppoted.conf"; then
+    sed -i 's/^httpd.http.port.*/httpd.http.port = 8088/' "$ETC_DIR/uhppoted.conf"
+  else
+    echo 'httpd.http.port = 8088' >> "$ETC_DIR/uhppoted.conf"
+  fi
+  grep -q '^httpd.http.port = 8088$' "$ETC_DIR/uhppoted.conf" \
+    || warn "could not move uhppoted-httpd to :8088 in $ETC_DIR/uhppoted.conf — nginx and httpd will both want :$HTTP_PORT"
   cat > /etc/nginx/sites-available/portcullis <<NG
 server {
   listen $HTTP_PORT default_server;
@@ -363,7 +376,11 @@ NG
   rm -f /etc/nginx/sites-enabled/default
   ln -sf /etc/nginx/sites-available/portcullis /etc/nginx/sites-enabled/portcullis
   systemctl daemon-reload
-  systemctl restart nginx 2>/dev/null || true
+  if nginx -t >/dev/null 2>&1; then
+    systemctl restart nginx || warn "nginx failed to restart (journalctl -u nginx) — the web UI will be down until it does"
+  else
+    warn "nginx config test failed (nginx -t) — the web UI will be down until it is fixed"
+  fi
 fi
 
 # ─── 9. firewall — lock REST + door shim to the integration hosts only ────────

@@ -5,56 +5,120 @@ Pages to view events and run the attendance / patrol / meeting modules, plus set
 configure each (patrol checkpoints & routes, meetings, cameras) without code changes. Reads the
 event history the collector maintains in SQLite and keeps its own config in the same DB.
 
-Runs on :8083 (put behind the Cloudflare tunnel / Access like the main UI). Flask app.
+Runs on :8083 behind nginx at /ops (same Cloudflare tunnel / Access gate as the main UI). Flask app.
+
+Security:
+  * every request must carry the Cloudflare Access identity header (Cf-Access-Authenticated-User-Email),
+    optionally restricted to PORTCULLIS_OPS_ALLOW (comma-separated emails); PORTCULLIS_OPS_AUTH=off disables;
+  * every POST must come from this same host (Origin/Referer check) — no cross-site form posts;
+  * all stored text is HTML-escaped on output.
+
 Copyright (c) 2026 TomTom Enterprises.
 """
-import os, sqlite3, datetime, subprocess
-from flask import Flask, request, redirect, url_for, render_template_string, send_file
+import os, re, datetime
+from urllib.parse import urlsplit
+from flask import Flask, request, redirect, url_for, render_template_string, send_file, g, abort
+from markupsafe import escape
 
-DB  = os.environ.get("PORTCULLIS_DB", "/var/lib/portcullis/portcullis.db")
+import portcullis_db as pdb
+
+SNAP_DIR = os.path.realpath(os.environ.get("PORTCULLIS_SNAPSHOTS", "/var/lib/portcullis/snapshots"))
+AUTH     = os.environ.get("PORTCULLIS_OPS_AUTH", "access").lower()
+ALLOW    = {e.strip().lower() for e in os.environ.get("PORTCULLIS_OPS_ALLOW", "").split(",") if e.strip()}
 app = Flask(__name__)
 
 
-_schema_ready = False
+def h(v):
+    """HTML-escape any value for interpolation into the page body."""
+    return str(escape("" if v is None else v))
 
 
-class _Conn(sqlite3.Connection):
-    """Connection subclass so the per-request door-name map can be cached on the handle."""
-
-
-def _ensure_schema(c):
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS events(idx INTEGER PRIMARY KEY, ts TEXT, card TEXT, door INTEGER,
-        granted INTEGER, event_type INTEGER, raw TEXT, collected_at TEXT);
-    CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
-    CREATE TABLE IF NOT EXISTS patrol_points(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, door INTEGER);
-    CREATE TABLE IF NOT EXISTS patrol_routes(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT,
-        doors TEXT, win_start TEXT, win_end TEXT);
-    CREATE TABLE IF NOT EXISTS meetings(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, door INTEGER,
-        start_ts TEXT, end_ts TEXT);
-    CREATE TABLE IF NOT EXISTS cameras(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, ip TEXT,
-        username TEXT, door INTEGER, rtsp TEXT, password TEXT, channel TEXT DEFAULT '101');
-    CREATE TABLE IF NOT EXISTS snapshots(idx INTEGER PRIMARY KEY, path TEXT, camera TEXT, taken_at TEXT);
-    """)
-    cols = [r[1] for r in c.execute("PRAGMA table_info(cameras)")]
-    if "password" not in cols: c.execute("ALTER TABLE cameras ADD COLUMN password TEXT")
-    if "channel"  not in cols: c.execute("ALTER TABLE cameras ADD COLUMN channel TEXT DEFAULT '101'")
+@app.before_request
+def gate():
+    if AUTH != "off":
+        who = request.headers.get("Cf-Access-Authenticated-User-Email", "").strip().lower()
+        if not who or (ALLOW and who not in ALLOW):
+            abort(403)
+    if request.method == "POST":                       # CSRF: same-host posts only
+        src = request.headers.get("Origin") or request.headers.get("Referer") or ""
+        if urlsplit(src).hostname != (request.host.split(":")[0] or None):
+            abort(403)
 
 
 def db():
-    global _schema_ready
-    c = sqlite3.connect(DB, factory=_Conn)
-    c.row_factory = sqlite3.Row
-    if not _schema_ready:                       # schema is created once, not on every request
-        _ensure_schema(c)
-        _schema_ready = True
-    s = {r[0]: r[1] for r in c.execute("SELECT k, v FROM settings")}   # door names loaded once/request
-    c.door_map = {n: (s.get(f"door{n}") or f"Door {n}") for n in (1, 2, 3, 4)}
-    return c
+    """One connection per request (closed on teardown) with the door-name map loaded once."""
+    if "db" not in g:
+        c = pdb.connect(pdb.sqlite3.Row)
+        s = {r[0]: r[1] for r in c.execute("SELECT k, v FROM settings")}
+        g.door_map = {n: (s.get(f"door{n}") or f"Door {n}") for n in (1, 2, 3, 4)}
+        g.db = c
+    return g.db
 
 
-def door_name(c, n):
-    return c.door_map.get(int(n), f"Door {n}")
+@app.teardown_appcontext
+def close_db(_exc):
+    c = g.pop("db", None)
+    if c is not None:
+        c.close()
+
+
+def door_name(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return f"Door {h(n)}"
+    return h(g.door_map.get(n, f"Door {n}"))
+
+
+def parse_days(default=30):
+    try:
+        return min(max(int(request.args.get("days", default)), 1), 3650)
+    except ValueError:
+        return default
+
+
+def parse_doors(csv):
+    """'1, 2,x,9' -> [1, 2] (ignores anything that isn't a door 1-4)."""
+    out = []
+    for d in (csv or "").split(","):
+        d = d.strip()
+        if d.isdigit() and 1 <= int(d) <= 4 and int(d) not in out:
+            out.append(int(d))
+    return out
+
+
+def valid_door(v):
+    return str(v).isdigit() and 1 <= int(v) <= 4
+
+
+def norm_hhmm(s, default):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", (s or "").strip())
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return default
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def norm_ts(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime((s or "").strip(), fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    return None
+
+
+def route_window(start, end, now):
+    """The current/most recent run of a patrol route as full timestamps. A window whose start is
+    later than its end (22:00-06:00) runs overnight: tonight's if it has begun, else last night's."""
+    s, e = norm_hhmm(start, "00:00"), norm_hhmm(end, "23:59")
+    today, day = now.date(), datetime.timedelta(days=1)
+    if s <= e:
+        a, b = today, today
+    elif now.strftime("%H:%M") >= s:
+        a, b = today, today + day
+    else:
+        a, b = today - day, today
+    return f"{a.isoformat()} {s}:00", f"{b.isoformat()} {e}:59"
 
 
 BASE = """<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -80,20 +144,30 @@ button{background:var(--brass);color:#0f141b;border:none;border-radius:8px;paddi
 button.del{background:#3a1f22;color:#e5484d;padding:5px 10px;font-weight:700}
 .tiles{display:flex;flex-wrap:wrap;gap:14px}.tile{flex:1;min-width:150px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
 .tile .n{font-size:30px;font-weight:800;color:var(--brass)}.tile .l{color:var(--muted);font-size:13px}
-.muted{color:var(--muted)}
+.muted{color:var(--muted)}.err{background:#3a1f22;color:#ff8a8e;border-radius:8px;padding:9px 12px}
 </style></head><body>
 <header><b>&#9113; PORTCULLIS OPS</b><span class=muted>access events &middot; attendance &middot; patrol &middot; meetings</span>
 <a href="/" style="margin-left:auto;color:var(--muted);text-decoration:none">&#8592; Access UI</a></header>
 <nav>
 {% for p,l in pages %}<a href="{{url_for(p)}}" class="{{'on' if active==p else ''}}">{{l}}</a>{% endfor %}
-</nav><main>{{ body|safe }}</main></body></html>"""
+</nav><main>{% if err %}<p class=err>{{err}}</p>{% endif %}{{ body|safe }}</main></body></html>"""
 
-PAGES = [("dashboard","Dashboard"),("events","Events"),("attendance","Attendance"),
-         ("patrol","Patrol"),("meetings","Meetings"),("cameras","Cameras"),("settings","Settings")]
+PAGES = [("dashboard", "Dashboard"), ("events", "Events"), ("attendance", "Attendance"),
+         ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"), ("settings", "Settings")]
 
 
 def page(active, title, body):
-    return render_template_string(BASE, pages=PAGES, active=active, title=title, body=body)
+    return render_template_string(BASE, pages=PAGES, active=active, title=title, body=body,
+                                  err=request.args.get("err", ""))
+
+
+def bad(endpoint, msg):
+    return redirect(url_for(endpoint, err=msg))
+
+
+def delete_form(field, ident):
+    return (f"<form method=post style=display:inline><input type=hidden name={field} value={int(ident)}>"
+            f"<button class=del>delete</button></form>")
 
 
 @app.route("/")
@@ -103,14 +177,14 @@ def dashboard():
     cards = c.execute("SELECT COUNT(DISTINCT card) n FROM events").fetchone()["n"]
     last  = c.execute("SELECT MAX(ts) t FROM events").fetchone()["t"] or "—"
     recent = c.execute("SELECT * FROM events ORDER BY idx DESC LIMIT 10").fetchall()
-    rows = "".join(f"<tr><td>{e['ts']}</td><td>{e['card']}</td><td>{door_name(c,e['door'])}</td>"
+    rows = "".join(f"<tr><td>{h(e['ts'])}</td><td>{h(e['card'])}</td><td>{door_name(e['door'])}</td>"
                    f"<td class='{'g' if e['granted'] else 'r'}'>{'granted' if e['granted'] else 'denied'}</td></tr>"
                    for e in recent) or "<tr><td colspan=4 class=muted>no events yet</td></tr>"
     body = f"""<h1>Dashboard</h1>
     <div class=tiles>
       <div class=tile><div class=n>{total}</div><div class=l>total events</div></div>
       <div class=tile><div class=n>{cards}</div><div class=l>distinct cards</div></div>
-      <div class=tile><div class=n style='font-size:16px'>{last}</div><div class=l>last event</div></div>
+      <div class=tile><div class=n style='font-size:16px'>{h(last)}</div><div class=l>last event</div></div>
     </div>
     <h2>Recent activity</h2><table><tr><th>Time</th><th>Card</th><th>Door</th><th>Result</th></tr>{rows}</table>"""
     return page("dashboard", "Dashboard", body)
@@ -118,14 +192,14 @@ def dashboard():
 
 @app.route("/events")
 def events():
-    c = db(); days = int(request.args.get("days", 30))
+    c = db(); days = parse_days()
     since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     evs = c.execute("""SELECT e.*, s.idx AS snap FROM events e LEFT JOIN snapshots s ON s.idx=e.idx
                        WHERE e.ts>=? ORDER BY e.idx DESC LIMIT 500""", (since,)).fetchall()
     cam = lambda e: (f"<a href='{url_for('snapshot', idx=e['idx'])}' target=_blank title='camera snapshot'>&#128247;</a>" if e['snap'] else "")
-    rows = "".join(f"<tr><td>{e['idx']}</td><td>{e['ts']}</td><td>{e['card']}</td><td>{door_name(c,e['door'])}</td>"
+    rows = "".join(f"<tr><td>{e['idx']}</td><td>{h(e['ts'])}</td><td>{h(e['card'])}</td><td>{door_name(e['door'])}</td>"
                    f"<td class='{'g' if e['granted'] else 'r'}'>{'granted' if e['granted'] else 'denied'}</td>"
-                   f"<td>{e['event_type']}</td><td>{cam(e)}</td></tr>" for e in evs) or "<tr><td colspan=7 class=muted>none</td></tr>"
+                   f"<td>{h(e['event_type'])}</td><td>{cam(e)}</td></tr>" for e in evs) or "<tr><td colspan=7 class=muted>none</td></tr>"
     body = f"""<h1>Events</h1>
     <form class=row method=get><div><label>show last (days)</label><input name=days value="{days}" size=5></div><button>Filter</button></form>
     <p class=muted>{len(evs)} events (most recent 500)</p>
@@ -135,12 +209,10 @@ def events():
 
 @app.route("/attendance")
 def attendance():
-    c = db(); days = int(request.args.get("days", 30))
-    since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
-    rs = c.execute("""SELECT date(ts) d, card, MIN(ts) f, MAX(ts) l, COUNT(*) n, COALESCE(SUM(granted),0) g
-                      FROM events WHERE ts>=? GROUP BY date(ts),card ORDER BY d DESC,card""", (since,)).fetchall()
-    rows = "".join(f"<tr><td>{r['d']}</td><td>{r['card']}</td><td>{r['f']}</td><td>{r['l']}</td>"
-                   f"<td>{r['n']}</td><td>{r['g']}</td></tr>" for r in rs) or "<tr><td colspan=6 class=muted>none</td></tr>"
+    c = db(); days = parse_days()
+    rows = "".join(f"<tr><td>{h(r['date'])}</td><td>{h(r['card'])}</td><td>{h(r['first_seen'])}</td>"
+                   f"<td>{h(r['last_seen'])}</td><td>{r['events']}</td><td>{r['granted']}</td></tr>"
+                   for r in pdb.attendance(c, days)) or "<tr><td colspan=6 class=muted>none</td></tr>"
     body = f"""<h1>Attendance</h1>
     <form class=row method=get><div><label>last (days)</label><input name=days value="{days}" size=5></div><button>Run</button></form>
     <table><tr><th>Date</th><th>Card</th><th>First seen</th><th>Last seen</th><th>Events</th><th>Granted</th></tr>{rows}</table>"""
@@ -153,46 +225,54 @@ def patrol():
     if request.method == "POST":
         f = request.form
         if f.get("add") == "point":
-            c.execute("INSERT INTO patrol_points(name,door) VALUES(?,?)", (f["name"], f["door"])); c.commit()
+            name = f.get("name", "").strip()
+            if not name or not valid_door(f.get("door")):
+                return bad("patrol", "Checkpoint needs a name and a door 1-4.")
+            c.execute("INSERT INTO patrol_points(name,door) VALUES(?,?)", (name, int(f["door"])))
         elif f.get("add") == "route":
+            name, doors = f.get("name", "").strip(), parse_doors(f.get("doors"))
+            if not name or not doors:
+                return bad("patrol", "Route needs a name and doors 1-4 separated by commas (e.g. 1,2).")
+            for k in ("win_start", "win_end"):
+                if f.get(k, "").strip() and norm_hhmm(f[k], None) is None:
+                    return bad("patrol", "Times must look like 22:00 (HH:MM).")
             c.execute("INSERT INTO patrol_routes(name,doors,win_start,win_end) VALUES(?,?,?,?)",
-                      (f["name"], f["doors"], f["win_start"], f["win_end"])); c.commit()
-        elif f.get("del_point"):
-            c.execute("DELETE FROM patrol_points WHERE id=?", (f["del_point"],)); c.commit()
-        elif f.get("del_route"):
-            c.execute("DELETE FROM patrol_routes WHERE id=?", (f["del_route"],)); c.commit()
+                      (name, ",".join(map(str, doors)), norm_hhmm(f.get("win_start"), "00:00"),
+                       norm_hhmm(f.get("win_end"), "23:59")))
+        elif f.get("del_point", "").isdigit():
+            c.execute("DELETE FROM patrol_points WHERE id=?", (f["del_point"],))
+        elif f.get("del_route", "").isdigit():
+            c.execute("DELETE FROM patrol_routes WHERE id=?", (f["del_route"],))
+        c.commit()
         return redirect(url_for("patrol"))
     pts = c.execute("SELECT * FROM patrol_points ORDER BY name").fetchall()
     rts = c.execute("SELECT * FROM patrol_routes ORDER BY name").fetchall()
-    dsel = "".join(f"<option value={n}>{door_name(c,n)}</option>" for n in (1, 2, 3, 4))
-    prows = "".join(f"<tr><td>{p['name']}</td><td>{door_name(c,p['door'])}</td>"
-                    f"<td><form method=post style=display:inline><input type=hidden name=del_point value={p['id']}>"
-                    f"<button class=del>delete</button></form></td></tr>" for p in pts) or "<tr><td colspan=3 class=muted>no checkpoints</td></tr>"
-    # route status today
-    today = datetime.date.today().isoformat()
+    dsel = "".join(f"<option value={n}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
+    prows = "".join(f"<tr><td>{h(p['name'])}</td><td>{door_name(p['door'])}</td><td>{delete_form('del_point', p['id'])}</td></tr>"
+                    for p in pts) or "<tr><td colspan=3 class=muted>no checkpoints</td></tr>"
+    now = datetime.datetime.now()
     rrows = ""
     for r in rts:
-        doors = [d for d in (r["doors"] or "").split(",") if d.strip()]
+        a, b = route_window(r["win_start"], r["win_end"], now)
         hits = []
-        for d in doors:
-            n = c.execute("SELECT COUNT(*) n FROM events WHERE door=? AND date(ts)=? AND time(ts)>=? AND time(ts)<=?",
-                          (d.strip(), today, r["win_start"] or "00:00", r["win_end"] or "23:59")).fetchone()["n"]
-            hits.append(f"<span class='{'g' if n else 'r'}'>{door_name(c,int(d))}{'✓' if n else '✗'}</span>")
-        rrows += (f"<tr><td>{r['name']}</td><td>{r['win_start']}–{r['win_end']}</td><td>{' '.join(hits)}</td>"
-                  f"<td><form method=post style=display:inline><input type=hidden name=del_route value={r['id']}>"
-                  f"<button class=del>delete</button></form></td></tr>")
+        for d in parse_doors(r["doors"]):
+            n = c.execute("SELECT COUNT(*) n FROM events WHERE door=? AND ts>=? AND ts<=?", (d, a, b)).fetchone()["n"]
+            hits.append(f"<span class='{'g' if n else 'r'}'>{door_name(d)}{'✓' if n else '✗'}</span>")
+        rrows += (f"<tr><td>{h(r['name'])}</td><td>{h(norm_hhmm(r['win_start'], '00:00'))}–{h(norm_hhmm(r['win_end'], '23:59'))}</td>"
+                  f"<td>{' '.join(hits) or '<span class=muted>no valid doors</span>'}</td><td>{delete_form('del_route', r['id'])}</td></tr>")
     rrows = rrows or "<tr><td colspan=4 class=muted>no routes</td></tr>"
     body = f"""<h1>Patrol</h1>
     <div class=card><h2>Checkpoints</h2><table><tr><th>Name</th><th>Reader/Door</th><th></th></tr>{prows}</table>
       <form class=row method=post><input type=hidden name=add value=point>
         <div><label>name</label><input name=name required></div>
         <div><label>door</label><select name=door>{dsel}</select></div><button>Add checkpoint</button></form></div>
-    <div class=card><h2>Routes (status for today)</h2><table><tr><th>Route</th><th>Window</th><th>Checkpoints hit</th><th></th></tr>{rrows}</table>
+    <div class=card><h2>Routes (status for the current run)</h2><table><tr><th>Route</th><th>Window</th><th>Checkpoints hit</th><th></th></tr>{rrows}</table>
       <form class=row method=post><input type=hidden name=add value=route>
         <div><label>name</label><input name=name required></div>
         <div><label>doors (csv e.g. 1,2)</label><input name=doors placeholder="1,2"></div>
         <div><label>from</label><input name=win_start placeholder="22:00" size=6></div>
-        <div><label>to</label><input name=win_end placeholder="06:00" size=6></div><button>Add route</button></form></div>"""
+        <div><label>to</label><input name=win_end placeholder="06:00" size=6></div><button>Add route</button></form>
+      <p class=muted>A window that ends before it starts (22:00 &ndash; 06:00) runs overnight.</p></div>"""
     return page("patrol", "Patrol", body)
 
 
@@ -201,30 +281,30 @@ def meetings():
     c = db()
     if request.method == "POST":
         f = request.form
-        if f.get("del"):
+        if f.get("del", "").isdigit():
             c.execute("DELETE FROM meetings WHERE id=?", (f["del"],))
         else:
-            c.execute("INSERT INTO meetings(name,door,start_ts,end_ts) VALUES(?,?,?,?)",
-                      (f["name"], f["door"], f["start_ts"], f["end_ts"]))
+            name, start, end = f.get("name", "").strip(), norm_ts(f.get("start_ts")), norm_ts(f.get("end_ts"))
+            if not name or not valid_door(f.get("door")) or not start or not end or end < start:
+                return bad("meetings", "Meeting needs a name, a door, and start/end like 2026-10-30 09:00 (end after start).")
+            c.execute("INSERT INTO meetings(name,door,start_ts,end_ts) VALUES(?,?,?,?)", (name, int(f["door"]), start, end))
         c.commit(); return redirect(url_for("meetings"))
     ms = c.execute("SELECT * FROM meetings ORDER BY start_ts DESC").fetchall()
-    dsel = "".join(f"<option value={n}>{door_name(c,n)}</option>" for n in (1, 2, 3, 4))
+    dsel = "".join(f"<option value={n}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
     rows = ""
     for m in ms:
         att = c.execute("SELECT COUNT(DISTINCT card) n FROM events WHERE door=? AND ts>=? AND ts<=? AND granted=1",
                         (m["door"], m["start_ts"], m["end_ts"])).fetchone()["n"]
-        rows += (f"<tr><td>{m['name']}</td><td>{door_name(c,m['door'])}</td><td>{m['start_ts']}</td><td>{m['end_ts']}</td>"
-                 f"<td class=g>{att} signed in</td>"
-                 f"<td><form method=post style=display:inline><input type=hidden name=del value={m['id']}>"
-                 f"<button class=del>delete</button></form></td></tr>")
+        rows += (f"<tr><td>{h(m['name'])}</td><td>{door_name(m['door'])}</td><td>{h(m['start_ts'])}</td><td>{h(m['end_ts'])}</td>"
+                 f"<td class=g>{att} signed in</td><td>{delete_form('del', m['id'])}</td></tr>")
     rows = rows or "<tr><td colspan=6 class=muted>no meetings</td></tr>"
     body = f"""<h1>Meetings</h1>
     <table><tr><th>Name</th><th>Reader</th><th>Start</th><th>End</th><th>Attendance</th><th></th></tr>{rows}</table>
     <div class=card><h2>Add meeting</h2><form class=row method=post>
       <div><label>name</label><input name=name required></div>
       <div><label>reader/door</label><select name=door>{dsel}</select></div>
-      <div><label>start (YYYY-MM-DD HH:MM:SS)</label><input name=start_ts size=20></div>
-      <div><label>end</label><input name=end_ts size=20></div><button>Add</button></form>
+      <div><label>start (YYYY-MM-DD HH:MM)</label><input name=start_ts size=20 required></div>
+      <div><label>end</label><input name=end_ts size=20 required></div><button>Add</button></form>
       <p class=muted>Attendance = distinct cards granted at that reader within the window.</p></div>"""
     return page("meetings", "Meetings", body)
 
@@ -234,24 +314,27 @@ def cameras():
     c = db()
     if request.method == "POST":
         f = request.form
-        if f.get("del"):
+        if f.get("del", "").isdigit():
             c.execute("DELETE FROM cameras WHERE id=?", (f["del"],))
         else:
+            name, ip, ch = f.get("name", "").strip(), f.get("ip", "").strip(), f.get("channel", "").strip() or "101"
+            if not name or not pdb.valid_host(ip) or not ch.isdigit() or not valid_door(f.get("door")):
+                return bad("cameras", "Camera needs a name, a valid IP/hostname, a numeric channel and a door.")
             c.execute("INSERT INTO cameras(name,ip,username,password,door,channel,rtsp) VALUES(?,?,?,?,?,?,?)",
-                      (f["name"], f["ip"], f.get("username", "admin"), f.get("password", ""),
-                       f["door"], f.get("channel", "101") or "101", f.get("rtsp", "")))
+                      (name, ip, f.get("username", "").strip() or "admin", f.get("password", ""),
+                       int(f["door"]), ch, f.get("rtsp", "").strip()))
         c.commit(); return redirect(url_for("cameras"))
     cams = c.execute("SELECT * FROM cameras ORDER BY name").fetchall()
-    dsel = "".join(f"<option value={n}>{door_name(c,n)}</option>" for n in (1, 2, 3, 4))
+    dsel = "".join(f"<option value={n}>{door_name(n)}</option>" for n in (1, 2, 3, 4))
     rows = "".join(
-        f"<tr><td>{m['name']}</td><td>{m['ip']}</td><td>{m['username']}</td>"
-        f"<td>{'&#9679; set' if m['password'] else '&mdash;'}</td><td>{m['channel'] or '101'}</td>"
-        f"<td>{door_name(c,m['door'])}</td>"
-        f"<td><a href='{url_for('camera_test', cid=m['id'])}' target=_blank>test</a></td>"
-        f"<td><form method=post style=display:inline><input type=hidden name=del value={m['id']}>"
-        f"<button class=del>delete</button></form></td></tr>" for m in cams) or "<tr><td colspan=8 class=muted>no cameras</td></tr>"
+        f"<tr><td>{h(m['name'])}</td><td>{h(m['ip'])}</td><td>{h(m['username'])}</td>"
+        f"<td>{'&#9679; set' if m['password'] else '&mdash;'}</td><td>{h(m['channel'] or '101')}</td>"
+        f"<td>{door_name(m['door'])}</td>"
+        f"<td><form method=post action='{url_for('camera_test', cid=m['id'])}' target=_blank style=display:inline>"
+        f"<button class=del>test</button></form></td>"
+        f"<td>{delete_form('del', m['id'])}</td></tr>" for m in cams) or "<tr><td colspan=8 class=muted>no cameras</td></tr>"
     body = f"""<h1>Cameras</h1>
-    <p class=muted>Hikvision ISAPI. A camera linked to a door gets an auto-snapshot when that door fires an event (shown on the Events page with &#128247;).</p>
+    <p class=muted>Hikvision ISAPI. A camera linked to a door gets an auto-snapshot when that door fires an event (shown on the Events page with &#128247;). Snapshots are kept for 30 days.</p>
     <table><tr><th>Name</th><th>IP</th><th>User</th><th>Pass</th><th>Ch</th><th>Door</th><th>Test</th><th></th></tr>{rows}</table>
     <div class=card><h2>Add camera</h2><form class=row method=post>
       <div><label>name</label><input name=name required></div>
@@ -268,26 +351,22 @@ def cameras():
 
 @app.route("/snapshot/<int:idx>")
 def snapshot(idx):
-    c = db()
-    r = c.execute("SELECT path FROM snapshots WHERE idx=?", (idx,)).fetchone()
-    if r and r["path"] and os.path.exists(r["path"]):
-        return send_file(r["path"], mimetype="image/jpeg")
+    r = db().execute("SELECT path FROM snapshots WHERE idx=?", (idx,)).fetchone()
+    if r and r["path"]:
+        p = os.path.realpath(r["path"])
+        if p.startswith(SNAP_DIR + os.sep) and os.path.exists(p):   # only ever serve files under SNAP_DIR
+            return send_file(p, mimetype="image/jpeg")
     return "no snapshot", 404
 
 
-@app.route("/cameras/test/<int:cid>")
+@app.route("/cameras/test/<int:cid>", methods=["POST"])
 def camera_test(cid):
-    c = db()
-    m = c.execute("SELECT * FROM cameras WHERE id=?", (cid,)).fetchone()
+    m = db().execute("SELECT * FROM cameras WHERE id=?", (cid,)).fetchone()
     if not m or not m["ip"]:
         return "camera not found", 404
-    out = f"/tmp/cam_test_{cid}.jpg"
-    url = f"http://{m['ip']}/ISAPI/Streaming/channels/{m['channel'] or '101'}/picture"
-    r = subprocess.run(["curl", "-s", "--max-time", "8", "--digest",
-                        "-u", f"{m['username'] or 'admin'}:{m['password'] or ''}", url, "-o", out],
-                       capture_output=True)
-    if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1000:
-        return send_file(out, mimetype="image/jpeg")
+    jpg = pdb.fetch_jpeg(m["ip"], m["channel"], m["username"], m["password"])
+    if jpg:
+        return app.response_class(jpg, mimetype="image/jpeg")
     return "snapshot failed — check IP / credentials / channel", 502
 
 
@@ -297,9 +376,9 @@ def settings():
     if request.method == "POST":
         for n in (1, 2, 3, 4):
             c.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-                      (f"door{n}", request.form.get(f"door{n}", "")))
+                      (f"door{n}", request.form.get(f"door{n}", "").strip()[:40]))
         c.commit(); return redirect(url_for("settings"))
-    inputs = "".join(f"<div><label>Door {n} name</label><input name=door{n} value=\"{door_name(c,n)}\"></div>" for n in (1, 2, 3, 4))
+    inputs = "".join(f"<div><label>Door {n} name</label><input name=door{n} maxlength=40 value=\"{door_name(n)}\"></div>" for n in (1, 2, 3, 4))
     body = f"""<h1>Settings</h1>
     <div class=card><h2>Door names</h2>
       <form class=row method=post>{inputs}<button>Save</button></form>

@@ -7,26 +7,13 @@ maintains. This is the time-&-attendance core; patrol and meeting-sign build on 
   report.py [--days N] [--json]
 Copyright (c) 2026 TomTom Enterprises.
 """
-import sqlite3, os, sys, json, datetime
+import sys, json
 
-DB = os.environ.get("PORTCULLIS_DB", "/var/lib/portcullis/portcullis.db")
-
-
-def attendance(days=30):
-    con = sqlite3.connect(DB)
-    since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
-    rows = con.execute(
-        """SELECT date(ts) d, card, MIN(ts) first_seen, MAX(ts) last_seen,
-                  COUNT(*) events, COALESCE(SUM(granted),0) granted
-           FROM events WHERE ts >= ?
-           GROUP BY date(ts), card ORDER BY d DESC, card""", (since,)).fetchall()
-    return [{"date": r[0], "card": r[1], "first_seen": r[2], "last_seen": r[3],
-             "events": r[4], "granted": r[5]} for r in rows]
-
+import portcullis_db as pdb
 
 if __name__ == "__main__":
     days = int(sys.argv[sys.argv.index("--days") + 1]) if "--days" in sys.argv else 30
-    data = attendance(days)
+    data = pdb.attendance(pdb.connect(), days)
     if "--json" in sys.argv:
         print(json.dumps(data, indent=2))
     else:
