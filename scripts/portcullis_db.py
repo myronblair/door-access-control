@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS cameras(id INTEGER PRIMARY KEY AUTOINCREMENT, name TE
 CREATE TABLE IF NOT EXISTS snapshots(idx INTEGER PRIMARY KEY, path TEXT, camera TEXT, taken_at TEXT);
 CREATE TABLE IF NOT EXISTS peripherals(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, controller TEXT,
     door INTEGER, name TEXT, model TEXT, ip TEXT, notes TEXT, created TEXT);
+CREATE TABLE IF NOT EXISTS ops_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, who TEXT,
+    action TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS ix_opslog_ts ON ops_log(ts);
 """
 
 # Peripheral kinds the Devices inventory tracks. Cameras keep their own richer table (credentials +
@@ -155,6 +158,107 @@ def door_keypads(serial=None):
         chosen = next((c for c in ctrls if c["address"]), None) or (ctrls[0] if ctrls else {})
     doors = chosen.get("doors", {}) if chosen else {}
     return {n for n in (1, 2, 3, 4) if oid_keypad.get(doors.get(str(n), ""))}
+
+
+def _door_oid_to_pos(serial):
+    """For a controller, map each door-record OID to its physical position 1..4."""
+    c = next((x for x in httpd_controllers() if x["serial"] == str(serial)), None)
+    if not c:
+        c = next((x for x in httpd_controllers() if x["address"]), None) or {}
+    return {oid: int(pos) for pos, oid in (c.get("doors", {}) or {}).items() if oid}
+
+
+def intended_doors(serial):
+    """What the Access UI DB says each assigned door's {mode, delay} should be, by position."""
+    oid_rec = {d.get("OID"): d for d in _httpd_json("doors.json").get("doors", [])}
+    out = {}
+    for oid, pos in _door_oid_to_pos(serial).items():
+        d = oid_rec.get(oid)
+        if d:
+            out[pos] = {"mode": (d.get("mode") or "controlled").lower(), "delay": int(d.get("delay") or 0)}
+    return out
+
+
+def intended_acl(serial):
+    """The ACL the Access UI DB intends for this controller: {card_number: {"from","to","doors":set(pos)}}.
+    A card's doors are the union of its groups' doors (uhppoted's model), mapped to this controller."""
+    groups = {g.get("OID"): (g.get("doors") or []) for g in _httpd_json("groups.json").get("groups", [])}
+    oid_pos = _door_oid_to_pos(serial)
+    acl = {}
+    for c in _httpd_json("cards.json").get("cards", []):
+        if not c.get("card"):
+            continue
+        pos = set()
+        for goid in (c.get("groups") or []):
+            for doid in groups.get(goid, []):
+                if doid in oid_pos:
+                    pos.add(oid_pos[doid])
+        if pos:                                   # only cards that open at least one door on THIS controller
+            acl[str(c["card"])] = {"from": c.get("from") or "", "to": c.get("to") or "", "doors": pos}
+    return acl
+
+
+def controller_acl(serial, conf=None, timeout=10):
+    """The cards actually on the controller: {card_number: {"from","to","doors":set(pos)}}, or None."""
+    conf = conf or os.environ.get("PORTCULLIS_CONF", "/etc/uhppoted/uhppoted.conf")
+    rc, out = cli(conf, "get-cards", str(serial), timeout=timeout)
+    if rc != 0:
+        return None
+    acl = {}
+    for line in out.splitlines():
+        p = line.split()
+        # "22322431 2016-01-01 2099-12-31 Y Y N N 345678 -"
+        if len(p) >= 7 and p[0].isdigit():
+            doors = {i + 1 for i in range(4) if p[3 + i].upper() == "Y"}
+            acl[p[0]] = {"from": p[1], "to": p[2], "doors": doors}
+    return acl
+
+
+def sync_status(serial, conf=None, timeout=6):
+    """Compare a controller against the Access UI DB. Returns {reachable, time, doors, acl} where each
+    facet is {ok, detail}. Fast-fails if the controller is unreachable so the page never hangs."""
+    conf = conf or os.environ.get("PORTCULLIS_CONF", "/etc/uhppoted/uhppoted.conf")
+    import datetime as _dt
+    st = {"reachable": False, "time": {"ok": None, "detail": ""}, "doors": {"ok": None, "detail": ""},
+          "acl": {"ok": None, "detail": ""}}
+    rc, out = cli(conf, "get-time", str(serial), timeout=timeout)
+    m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", out)
+    if rc != 0 or not m:
+        return st                                 # offline — leave everything unknown
+    st["reachable"] = True
+    off = (_dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") - _dt.datetime.now()).total_seconds()
+    st["time"] = {"ok": abs(off) <= 90,
+                  "detail": "in sync" if abs(off) <= 90 else f"off by {int(abs(off))}s ({'ahead' if off>0 else 'behind'})"}
+
+    want, diffs = intended_doors(serial), []
+    for pos, w in sorted(want.items()):
+        rc1, o1 = cli(conf, "get-door-control", str(serial), str(pos), timeout=timeout)
+        rc2, o2 = cli(conf, "get-door-delay", str(serial), str(pos), timeout=timeout)
+        mode = (re.search(r"\(([^)]+)\)", o1).group(1).lower() if rc1 == 0 and "(" in o1 else "?")
+        dm = re.search(r"\b(\d+)\b\s*$", o2)
+        delay = int(dm.group(1)) if rc2 == 0 and dm else -1
+        if mode != w["mode"] or delay != w["delay"]:
+            diffs.append(f"door {pos}: panel {mode}/{delay if delay>=0 else '?'}s vs DB {w['mode']}/{w['delay']}s")
+    st["doors"] = {"ok": not diffs, "detail": "in sync" if not diffs else "; ".join(diffs)} if want \
+        else {"ok": True, "detail": "no doors assigned in DB"}
+
+    cur, want_acl = controller_acl(serial, timeout=timeout + 4), intended_acl(serial)
+    if cur is None:
+        st["acl"] = {"ok": None, "detail": "could not read cards"}
+    else:
+        extra = sorted(set(cur) - set(want_acl))
+        missing = sorted(set(want_acl) - set(cur))
+        changed = [c for c in set(cur) & set(want_acl)
+                   if cur[c]["doors"] != want_acl[c]["doors"] or cur[c]["from"] != want_acl[c]["from"]
+                   or cur[c]["to"] != want_acl[c]["to"]]
+        n = len(extra) + len(missing) + len(changed)
+        bits = []
+        if extra:   bits.append(f"{len(extra)} on panel not in DB")
+        if missing: bits.append(f"{len(missing)} in DB not on panel")
+        if changed: bits.append(f"{len(changed)} differ")
+        st["acl"] = {"ok": n == 0, "detail": "in sync" if n == 0 else "; ".join(bits),
+                     "extra": extra, "missing": missing, "changed": changed}
+    return st
 
 
 def discover_onvif(timeout=3):

@@ -27,7 +27,17 @@ CONF = os.environ.get("PORTCULLIS_CONF", "/etc/uhppoted/uhppoted.conf")
 SNAP_DIR = os.path.realpath(os.environ.get("PORTCULLIS_SNAPSHOTS", "/var/lib/portcullis/snapshots"))
 AUTH     = os.environ.get("PORTCULLIS_OPS_AUTH", "access").lower()
 ALLOW    = {e.strip().lower() for e in os.environ.get("PORTCULLIS_OPS_ALLOW", "").split(",") if e.strip()}
+STRIDE   = 1_000_000_000                                # must match collector.py's per-controller namespace
 app = Flask(__name__)
+
+
+def meta_get(c, k, default=None):
+    r = c.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+    return r[0] if r and r[0] is not None else default
+
+
+def meta_set(c, k, v):
+    c.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
 
 
 def h(v):
@@ -35,16 +45,49 @@ def h(v):
     return str(escape("" if v is None else v))
 
 
+_allow_cache = {"emails": None, "ts": 0.0}
+
+
+def allowed_emails():
+    """The Ops access list: emails from the DB settings (managed on the Users page) plus any from the
+    PORTCULLIS_OPS_ALLOW env. Empty set = allow any Cloudflare-authenticated user. Cached 5s."""
+    import time
+    if _allow_cache["emails"] is None or time.time() - _allow_cache["ts"] > 5:
+        s = set(ALLOW)
+        try:
+            c = pdb.connect()
+            row = c.execute("SELECT v FROM settings WHERE k='ops_allow'").fetchone()
+            c.close()
+            if row and row[0]:
+                s |= {e.strip().lower() for e in row[0].split(",") if e.strip()}
+        except Exception:
+            pass
+        _allow_cache.update(emails=s, ts=time.time())
+    return _allow_cache["emails"]
+
+
 @app.before_request
 def gate():
+    g.who = request.headers.get("Cf-Access-Authenticated-User-Email", "").strip().lower() or "unknown"
     if AUTH != "off":
-        who = request.headers.get("Cf-Access-Authenticated-User-Email", "").strip().lower()
-        if not who or (ALLOW and who not in ALLOW):
+        allow = allowed_emails()
+        if g.who == "unknown" or (allow and g.who not in allow):
             abort(403)
     if request.method == "POST":                       # CSRF: reject only explicit cross-origin posts
         src = request.headers.get("Origin") or request.headers.get("Referer")
         if src and urlsplit(src).hostname != request.host.split(":")[0]:
             abort(403)
+
+
+def audit(action, detail=""):
+    """Record a mutation in the Ops action log (who/when/what)."""
+    try:
+        db().execute("INSERT INTO ops_log(ts,who,action,detail) VALUES(?,?,?,?)",
+                     (datetime.datetime.now().isoformat(timespec="seconds"), getattr(g, "who", "unknown"),
+                      action[:60], str(detail)[:300]))
+        db().commit()
+    except Exception:
+        pass
 
 
 def db():
@@ -142,6 +185,12 @@ BASE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 'Lato',system-ui,sans-serif}
 header{display:flex;align-items:center;gap:14px;padding:14px 20px;background:linear-gradient(90deg,#0b0f14,#161d27);border-bottom:2px solid var(--brass)}
 header b{font-size:20px;font-weight:800;letter-spacing:.5px;color:var(--brass)}
+.badge{margin-left:auto;padding:5px 12px;border-radius:20px;font-weight:800;font-size:13px;text-decoration:none;border:1px solid}
+.badge.ok{color:#2ec77a;border-color:#2ec77a33;background:#2ec77a14}
+.badge.warn{color:#e5484d;border-color:#e5484d44;background:#e5484d1a}
+.badge.unknown{color:var(--muted);border-color:var(--line);background:#ffffff08}
+.pill{display:inline-block;padding:2px 9px;border-radius:12px;font-size:12px;font-weight:700}
+.pill.ok{color:#2ec77a;background:#2ec77a1a}.pill.warn{color:#e5484d;background:#e5484d1a}.pill.unknown{color:var(--muted);background:#ffffff0d}
 nav{display:flex;flex-wrap:wrap;gap:4px;padding:10px 16px;background:#0b0f14;border-bottom:1px solid var(--line)}
 nav a{color:var(--muted);text-decoration:none;padding:7px 13px;border-radius:8px;font-weight:700}
 nav a:hover{color:var(--text);background:#161d27}nav a.on{color:#0f141b;background:var(--brass)}
@@ -161,19 +210,34 @@ button.del{background:#3a1f22;color:#e5484d;padding:5px 10px;font-weight:700}
 .muted{color:var(--muted)}.err{background:#3a1f22;color:#ff8a8e;border-radius:8px;padding:9px 12px}
 </style></head><body>
 <header><b>&#9113; PORTCULLIS OPS</b><span class=muted>access events &middot; attendance &middot; patrol &middot; meetings</span>
-<a href="/" style="margin-left:auto;color:var(--muted);text-decoration:none">&#8592; Access UI</a></header>
+<a href="{{url_for('sync')}}" class="badge {{badge_level}}" title="controller sync status">{{badge_text}}</a>
+<a href="/" style="margin-left:14px;color:var(--muted);text-decoration:none">&#8592; Access UI</a></header>
 <nav>
 {% for p,l in pages %}<a href="{{url_for(p)}}" class="{{'on' if active==p else ''}}">{{l}}</a>{% endfor %}
 </nav><main>{% if err %}<p class=err>{{err}}</p>{% endif %}{{ body|safe }}</main></body></html>"""
 
 PAGES = [("dashboard", "Dashboard"), ("events", "Events"), ("attendance", "Attendance"),
          ("patrol", "Patrol"), ("meetings", "Meetings"), ("cameras", "Cameras"),
-         ("devices", "Devices"), ("controllers", "Controllers"), ("settings", "Settings")]
+         ("devices", "Devices"), ("controllers", "Controllers"), ("sync", "Sync"), ("settings", "Settings")]
+
+
+def sync_badge():
+    """Cheap header badge from the last computed sync snapshot (the Sync page refreshes it)."""
+    try:
+        v = meta_get(db(), "sync_badge")
+    except Exception:
+        v = None
+    if v == "ok":
+        return "ok", "✓ controllers synced"
+    if v == "warn":
+        return "warn", "⚠ sync needed"
+    return "unknown", "sync status ?"
 
 
 def page(active, title, body):
+    lvl, txt = sync_badge()
     return render_template_string(BASE, pages=PAGES, active=active, title=title, body=body,
-                                  err=request.args.get("err", ""))
+                                  err=request.args.get("err", ""), badge_level=lvl, badge_text=txt)
 
 
 def bad(endpoint, msg):
@@ -404,6 +468,90 @@ def settings():
     <div class=card><h2>Listener guard (anti phone-home)</h2>
       <p class=muted>Controlled by the door-control service on :8082 — <code>/guard/on</code>, <code>/guard/off</code>, <code>/guard/enforce</code> (Bearer token). Currently enforced to this host.</p></div>"""
     return page("settings", "Settings", body)
+
+
+def _facet(label, f):
+    lvl = "ok" if f["ok"] else ("warn" if f["ok"] is False else "unknown")
+    txt = {"ok": "synced", "warn": "NOT synced", "unknown": "unknown"}[lvl]
+    return (f"<tr><td>{label}</td><td><span class='pill {lvl}'>{txt}</span></td>"
+            f"<td class=muted>{h(f.get('detail',''))}</td></tr>")
+
+
+@app.route("/sync", methods=["GET", "POST"])
+def sync():
+    c = db()
+    cfg = pdb.configured_controllers(CONF)
+    names = known_controllers()
+    if request.method == "POST":
+        f = request.form
+        serial, act = f.get("serial", "").strip(), f.get("action", "")
+        if serial not in cfg:
+            return bad("sync", "Unknown controller.")
+        if act == "settime":
+            rc, out = pdb.cli(CONF, "set-time", serial, "now", timeout=12)
+            audit("set time", f"{serial}: {'ok' if rc==0 else out[:100]}")
+        elif act == "syncdoors":
+            msgs = []
+            for pos, w in sorted(pdb.intended_doors(serial).items()):
+                r1, _ = pdb.cli(CONF, "set-door-control", serial, str(pos), w["mode"], timeout=12)
+                r2, _ = pdb.cli(CONF, "set-door-delay", serial, str(pos), str(w["delay"]), timeout=12)
+                msgs.append(f"d{pos}:{'ok' if r1==0 and r2==0 else 'err'}")
+            audit("sync doors", f"{serial}: {' '.join(msgs) or 'no doors in DB'}")
+        elif act == "syncacl":
+            if f.get("confirm") != "yes":
+                return bad("sync", "Tick the confirm box before syncing the ACL — it rewrites the panel's card list.")
+            want, cur = pdb.intended_acl(serial), (pdb.controller_acl(serial, CONF) or {})
+            n = 0
+            for card in sorted(set(cur) - set(want)):                 # remove cards not in the DB
+                pdb.cli(CONF, "delete-card", serial, card, timeout=12); n += 1
+            for card, w in want.items():                              # add/update intended cards
+                frm, to = (w["from"] or "2000-01-01"), (w["to"] or "2099-12-31")
+                doors = ",".join(str(x) for x in sorted(w["doors"])) or "1"
+                pdb.cli(CONF, "put-card", serial, card, frm, to, doors, timeout=12); n += 1
+            audit("sync acl", f"{serial}: {n} card writes")
+        return redirect(url_for("sync"))
+
+    blocks, worst = "", "ok"
+    for serial in cfg:
+        st = pdb.sync_status(serial, CONF)
+        label = h(names.get(serial, serial))
+        if not st["reachable"]:
+            worst = "warn" if worst != "unknown" else worst
+            blocks += (f"<div class=card><h2>{label} <span class=muted>({h(serial)})</span></h2>"
+                       f"<p class=err>Controller offline — can't read its state to compare. Sync status unknown.</p></div>")
+            if worst == "ok": worst = "unknown"
+            continue
+        facets = [("Date / time", st["time"]), ("Door config", st["doors"]), ("Card ACL", st["acl"])]
+        if any(x[1]["ok"] is False for x in facets):
+            worst = "warn"
+        acl = st["acl"]
+        acldetail = ""
+        if acl.get("ok") is False:
+            parts = []
+            if acl.get("extra"):   parts.append("on panel, not in DB: " + ", ".join(acl["extra"][:20]))
+            if acl.get("missing"): parts.append("in DB, not on panel: " + ", ".join(acl["missing"][:20]))
+            if acl.get("changed"): parts.append("access/validity differs: " + ", ".join(acl["changed"][:20]))
+            acldetail = "<p class=muted style='margin:6px 0 0'>" + "<br>".join(h(p) for p in parts) + "</p>"
+        btn = lambda a, lbl, extra="": (f"<form method=post style=display:inline>"
+              f"<input type=hidden name=serial value='{escape(serial)}'><input type=hidden name=action value={a}>"
+              f"{extra}<button>{lbl}</button></form>")
+        aclbtn = btn("syncacl", "Sync ACL &rarr; panel",
+                     "<label style='display:inline;margin:0 6px 0 0'><input type=checkbox name=confirm value=yes> confirm</label>")
+        blocks += (f"""<div class=card><h2>{label} <span class=muted>({h(serial)})</span></h2>
+          <table><tr><th>Item</th><th>Status</th><th>Detail</th></tr>
+          {''.join(_facet(l, fct) for l, fct in facets)}</table>{acldetail}
+          <div style='margin-top:12px;display:flex;gap:8px;flex-wrap:wrap'>
+            {btn('settime','Set date/time')}{btn('syncdoors','Sync doors')}{aclbtn}</div>
+          <p class=muted style='margin-top:8px'>These push the Access UI&rsquo;s saved config to the panel. The panel keeps its
+          old settings until you do. &ldquo;Sync ACL&rdquo; makes the panel&rsquo;s card list exactly match the DB (extra cards are removed).</p>
+        </div>""")
+    if not cfg:
+        blocks = "<p class=muted>No controllers in the service config.</p>"
+    meta_set(c, "sync_badge", worst); c.commit()
+    body = f"""<h1>Controller sync</h1>
+    <p class=muted>Changes made in the Access UI (doors, cards, time) only update the panel after you push them here.
+    This page reads each panel live and shows what still needs syncing.</p>{blocks}"""
+    return page("sync", "Sync", body)
 
 
 def known_controllers():

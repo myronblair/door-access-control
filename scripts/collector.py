@@ -186,7 +186,8 @@ def poll_one(con, serial):
         log(f"{serial} event counter went backwards ({last} < {have}); rebasing its indices")
         meta_set(con, f"off_{serial}", top - pos)  # new base == top, so fresh events land above the old
         base, have = top, 0
-    start = max(have + 1, first)
+    floor = int(meta_get(con, f"floor_{serial}", "0"))   # 'clear all events' sets this so cleared history isn't re-collected
+    start = max(have + 1, first, floor + 1)
     n = 0
     fresh = []
     now = datetime.datetime.now().isoformat(timespec="seconds")
